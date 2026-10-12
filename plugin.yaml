@@ -1,0 +1,7 @@
+manifest_version: 2
+name: hermes-usage-gate
+version: 0.1.0
+description: "Hold back new board cards for a provider's bots while that provider's plan usage is above configurable thresholds; chats, schedules and webhooks are never gated."
+homepage: "https://github.com/sergiojrdotnet/hermes-usage-gate"
+provides_hooks:
+  - on_kanban_dispatch_tick
