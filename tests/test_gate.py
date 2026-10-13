@@ -11,6 +11,7 @@ from usage_gate import gate, runtime
 from usage_gate.gate import OPEN, PAUSED, Reading, Thresholds
 
 NOW = datetime(2026, 10, 12, 23, 0, tzinfo=timezone.utc)
+NO_CARDS = mock.patch.object(runtime, "_kanban", return_value=SimpleNamespace(returncode=0, stdout="[]", stderr=""))
 T = Thresholds(session_percent=70, week_percent=80)
 
 
@@ -126,7 +127,7 @@ class RuntimeTest(unittest.TestCase):
         readings = {"claude": Reading("claude", NOW, windows=({"label": "Current session", "kind": "session", "used_percent": 100},)),
                     "openai-codex": Reading("openai-codex", NOW, windows=({"label": "Session", "kind": "session", "used_percent": 40},))}
         calls = []
-        with mock.patch.object(runtime, "fetch", side_effect=lambda p, m: readings[p]), \
+        with mock.patch.object(runtime, "fetch", side_effect=lambda p, m: readings[p]), NO_CARDS, \
              mock.patch.object(runtime, "_hermes", side_effect=lambda *a: calls.append(a) or SimpleNamespace(returncode=0, stderr="")):
             state = runtime.refresh(force=True)
             runtime.refresh(force=True)
@@ -145,7 +146,7 @@ class RuntimeTest(unittest.TestCase):
 
     def test_failed_write_keeps_previous_allowlist(self):
         reading = lambda p, m: Reading(p, NOW, windows=({"label": "Session", "kind": "session", "used_percent": 99},))
-        with mock.patch.object(runtime, "fetch", side_effect=reading), \
+        with mock.patch.object(runtime, "fetch", side_effect=reading), NO_CARDS, \
              mock.patch.object(runtime, "_hermes", return_value=SimpleNamespace(returncode=1, stderr="boom")):
             state = runtime.refresh(force=True)
         self.assertIsNone(state["applied"])
@@ -156,6 +157,80 @@ class RuntimeTest(unittest.TestCase):
              mock.patch.object(runtime, "fetch") as fetch:
             runtime.refresh()
         fetch.assert_not_called()
+
+
+class EpisodeTest(unittest.TestCase):
+    def reading(self, used, at):
+        return Reading("p", at, windows=({"label": "Session", "kind": "session", "used_percent": used, "resets_at": None},))
+
+    def test_paused_since_is_stable_while_paused(self):
+        first = gate.decide(self.reading(90, NOW), T, None, timedelta(minutes=30))
+        second = gate.decide(self.reading(95, NOW + timedelta(minutes=10)), T, first, timedelta(minutes=30))
+        self.assertEqual(second["paused_since"], first["paused_since"])
+        self.assertEqual(second["over"][0]["threshold"], 70)
+
+    def test_reopening_clears_the_episode(self):
+        paused = gate.decide(self.reading(90, NOW), T, None, timedelta(minutes=30))
+        opened = gate.decide(self.reading(10, NOW + timedelta(minutes=10)), T, paused, timedelta(minutes=30))
+        self.assertNotIn("paused_since", opened)
+        again = gate.decide(self.reading(90, NOW + timedelta(minutes=20)), T, opened, timedelta(minutes=30))
+        self.assertNotEqual(again["paused_since"], paused["paused_since"])
+
+
+class CommentTextTest(unittest.TestCase):
+    def test_names_plan_window_threshold_and_local_reset(self):
+        from zoneinfo import ZoneInfo
+        over = [{"label": "Current session", "used_percent": 100, "threshold": 70,
+                 "resets_at": "2026-10-13T01:40:00+00:00"}]
+        text = gate.held_comment("Claude Pro", over, ZoneInfo("America/Sao_Paulo"))
+        self.assertIn("Claude Pro current session at 100% (threshold 70%)", text)
+        self.assertIn("2026-10-12 22:40 America/Sao_Paulo", text)
+        self.assertIn("starts on its own", text)
+
+    def test_settings_label_and_toggle(self):
+        s = gate.settings_from({"comment_held_cards": False, "providers": {"claude": {"label": "Claude Pro"}}})
+        self.assertFalse(s.comment_held_cards)
+        self.assertEqual((s.label("claude"), s.label("other")), ("Claude Pro", "other"))
+
+
+class HeldCardsTest(unittest.TestCase):
+    profiles = {"ceo": ("codex", "astra"), "cto": ("claude", "opus"), "web": ("claude", "opus")}
+    paused = {"claude": {"decision": PAUSED, "paused_since": "E1", "over": [{"label": "Session", "used_percent": 90,
+                                                                            "threshold": 70, "resets_at": None}]},
+              "codex": {"decision": OPEN}}
+
+    def run_sweep(self, notes, providers=None):
+        cards = {"ready": [{"id": "t_1", "assignee": "cto"}, {"id": "t_2", "assignee": "ceo"}],
+                 "review": [{"id": "t_3", "assignee": "web"}]}
+        comments = []
+
+        def kanban(*args):
+            if args[0] == "list":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(cards[args[2]]), stderr="")
+            comments.append(args[1])
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(runtime, "_kanban", side_effect=kanban), mock.patch.object(runtime, "_timezone", return_value=None):
+            kept = runtime.comment_held_cards(gate.settings_from(None), self.profiles, providers or self.paused, notes)
+        return kept, comments
+
+    def test_comments_only_cards_of_paused_bots(self):
+        kept, comments = self.run_sweep({})
+        self.assertEqual(sorted(comments), ["t_1", "t_3"])
+        self.assertEqual(kept, {"t_1": "E1", "t_3": "E1"})
+
+    def test_no_second_comment_in_the_same_pause(self):
+        _, comments = self.run_sweep({"t_1": "E1", "t_3": "E1"})
+        self.assertEqual(comments, [])
+
+    def test_new_pause_comments_again(self):
+        providers = {**self.paused, "claude": {**self.paused["claude"], "paused_since": "E2"}}
+        _, comments = self.run_sweep({"t_1": "E1", "t_3": "E1"}, providers)
+        self.assertEqual(sorted(comments), ["t_1", "t_3"])
+
+    def test_nothing_paused_lists_nothing(self):
+        kept, comments = self.run_sweep({"t_1": "E1"}, {"claude": {"decision": OPEN}})
+        self.assertEqual((kept, comments), ({}, []))
 
 
 if __name__ == "__main__":

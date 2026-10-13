@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
-from usage_gate.gate import Reading, allowlist, decide, reading_from_snapshot, settings_from, utcnow
+from usage_gate.gate import PAUSED, Reading, allowlist, decide, held_comment, reading_from_snapshot, settings_from, utcnow
 
 log = logging.getLogger("hermes_usage_gate")
 _lock = threading.Lock()
@@ -83,9 +83,69 @@ def fetch(provider: str, models: list[str]) -> Reading:
     return reading_from_snapshot(provider, snapshot, now, models)
 
 
-def _hermes(*args: str) -> subprocess.CompletedProcess:
+def _run_hermes(*args: str) -> subprocess.CompletedProcess:
     binary = os.environ.get("USAGE_GATE_HERMES_BIN") or str(Path.home() / ".local" / "bin" / "hermes")
-    return subprocess.run([binary, "-p", "default", "config", *args], capture_output=True, text=True, timeout=60)
+    return subprocess.run([binary, "-p", "default", *args], capture_output=True, text=True, timeout=60)
+
+
+def _hermes(*args: str) -> subprocess.CompletedProcess:
+    return _run_hermes("config", *args)
+
+
+def _kanban(*args: str) -> subprocess.CompletedProcess:
+    return _run_hermes("kanban", *args)
+
+
+def held_cards(paused_profiles: set[str]) -> list[dict]:
+    """Ready or review cards assigned to a paused bot: the cards the gate is holding back."""
+    cards = []
+    for status in ("ready", "review"):
+        result = _kanban("list", "--status", status, "--json")
+        if result.returncode != 0:
+            log.warning("usage gate: could not list %s cards: %s", status, result.stderr.strip()[-200:])
+            continue
+        try:
+            listing = json.loads(result.stdout or "[]")
+        except ValueError:
+            continue
+        listing = listing.get("tasks", []) if isinstance(listing, dict) else listing
+        cards.extend(c for c in listing if isinstance(c, dict) and c.get("assignee") in paused_profiles)
+    return cards
+
+
+def _timezone() -> Any:
+    name = _load_yaml(hermes_root() / "config.yaml").get("timezone")
+    if not name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(str(name))
+    except Exception:
+        return None
+
+
+def comment_held_cards(settings: Any, profiles: dict[str, tuple[str, str]], providers: dict[str, dict],
+                       notes: dict[str, str]) -> dict[str, str]:
+    """Leave one comment per held card per pause, so the board shows why it isn't starting.
+    Returns ``{card id: pause it was told about}`` for the cards still held."""
+    paused = {p: s for p, s in providers.items() if s.get("decision") == PAUSED}
+    if not paused:
+        return {}
+    by_profile = {name: provider for name, (provider, _) in profiles.items() if provider in paused}
+    tz = _timezone()
+    kept = {}
+    for card in held_cards(set(by_profile)):
+        card_id = str(card.get("id"))
+        provider = by_profile[card["assignee"]]
+        episode = paused[provider].get("paused_since") or ""
+        if notes.get(card_id) != episode:
+            text = held_comment(settings.label(provider), paused[provider].get("over") or [], tz)
+            result = _kanban("comment", card_id, "--author", "usage-gate", text)
+            if result.returncode != 0:
+                log.warning("usage gate: could not comment on %s: %s", card_id, result.stderr.strip()[-200:])
+                continue
+        kept[card_id] = episode
+    return kept
 
 
 def apply_allowlist(allowed: Optional[list[str]], applied: Optional[list[str]]) -> Optional[list[str]]:
@@ -127,11 +187,15 @@ def refresh(force: bool = False) -> dict:
             wanted = allowlist({name: p for name, (p, _) in profiles.items()}, providers)
         else:
             wanted = None
+        applied = apply_allowlist(wanted, applied)
+        notes = state.get("held_notes") or {}
+        if settings.enabled and settings.comment_held_cards:
+            notes = comment_held_cards(settings, profiles, providers, notes)
         state = {"checked_at": now.isoformat(), "enabled": settings.enabled,
                  "thresholds": {"session_percent": settings.default.session_percent,
                                 "week_percent": settings.default.week_percent,
                                 "per_provider": {k: vars(v) for k, v in settings.per_provider.items()}},
-                 "providers": providers, "applied": apply_allowlist(wanted, applied)}
+                 "providers": providers, "applied": applied, "held_notes": notes}
         save_state(state)
         return state
 
