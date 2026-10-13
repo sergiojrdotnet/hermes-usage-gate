@@ -1,6 +1,8 @@
 """Hermes side of the usage gate: read profiles, fetch usage, apply ``kanban.dispatch_profiles``."""
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -163,9 +165,22 @@ def apply_allowlist(allowed: Optional[list[str]], applied: Optional[list[str]]) 
     return allowed
 
 
+@contextlib.contextmanager
+def _exclusive():
+    """One refresh at a time across threads, processes and every profile's copy of this plugin."""
+    path = hermes_root() / "usage-gate" / "refresh.lock"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with _lock, open(path, "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def refresh(force: bool = False) -> dict:
     """Read every provider in use, decide, and apply the allowlist. Safe to call from any thread."""
-    with _lock:
+    with _exclusive():
         settings = read_settings()
         state = load_state()
         now = utcnow()

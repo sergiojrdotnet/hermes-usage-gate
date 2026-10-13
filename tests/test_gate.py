@@ -257,6 +257,30 @@ class StatusViewTest(RuntimeTest):
         self.assertEqual(view["timezone"], None)
 
 
+class ConcurrentRefreshTest(RuntimeTest):
+    def test_overlapping_refreshes_read_usage_once(self):
+        import threading
+        import time
+        runtime.save_state({"checked_at": (NOW - timedelta(hours=1)).isoformat(), "applied": None})
+        seen = []
+
+        def slow_fetch(provider, models):
+            seen.append(provider)
+            time.sleep(0.2)
+            return Reading(provider, NOW, windows=({"label": "Session", "kind": "session", "used_percent": 5},))
+
+        with mock.patch.object(runtime, "fetch", side_effect=slow_fetch), NO_CARDS, \
+             mock.patch.object(runtime, "utcnow", return_value=NOW), \
+             mock.patch.object(runtime, "_hermes", return_value=SimpleNamespace(returncode=0, stderr="")):
+            threads = [threading.Thread(target=runtime.refresh) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(sorted(seen), ["claude", "openai-codex"])
+        self.assertTrue((Path(os.environ["USAGE_GATE_HERMES_ROOT"]) / "usage-gate" / "refresh.lock").exists())
+
+
 class HookGuardTest(unittest.TestCase):
     def test_only_the_default_profile_drives_the_gate(self):
         with mock.patch.object(runtime.threading, "Thread") as thread:
