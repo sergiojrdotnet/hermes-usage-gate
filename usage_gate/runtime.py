@@ -7,18 +7,22 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import threading
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
-from usage_gate.gate import (RESUME, WAIT, Reading, allowlist, decide, held_comment, held_episode, held_windows,
-                             holds, is_limit_error, openrouter_held_comment, openrouter_state, reading_from_snapshot,
-                             resume_action, settings_from, utcnow)
+from usage_gate.gate import (RESUME, WAIT, Reading, allowlist, claude_plan, decide, held_comment, held_episode,
+                             held_windows, holds, is_limit_error, openrouter_held_comment, openrouter_state,
+                             reading_from_snapshot, resume_action, settings_from, utcnow)
 
 log = logging.getLogger("hermes_usage_gate")
 CHAT_PLATFORMS = ("desktop", "tui", "cli")
 RESUME_CHAIN = timedelta(hours=1)
+CLAUDE_PLUGIN = "claude-subscription-directsdk"
+CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 _lock = threading.Lock()
 _running = threading.Event()
 
@@ -86,7 +90,30 @@ def fetch(provider: str, models: list[str]) -> Reading:
         snapshot = fetch_account_usage(provider, read_only=True)
     except Exception as exc:
         return Reading(provider, now, error=f"fetch failed: {exc}")
-    return reading_from_snapshot(provider, snapshot, now, models)
+    reading = reading_from_snapshot(provider, snapshot, now, models)
+    if reading.plan is None and provider.startswith(CLAUDE_PLUGIN):
+        reading = replace(reading, plan=claude_profile_plan(provider))
+    return reading
+
+
+def claude_profile_plan(provider: str) -> Optional[str]:
+    """The Claude subscription's plan from its account profile. The Claude plugin's usage reply doesn't name it, so
+    this borrows the plugin's own token helper; any failure names no plan and the last one known stays."""
+    try:
+        import httpx
+        from providers import get_provider_profile
+        plugin = sys.modules[type(get_provider_profile(provider)).__module__]
+        token, _ = plugin._subscription_token()
+        if not token:
+            return None
+        response = httpx.get(CLAUDE_PROFILE_URL, timeout=8.0, headers={
+            "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20", "Accept": "application/json",
+            "User-Agent": "claude-code/2.1.0"})
+        response.raise_for_status()
+        return claude_plan(response.json())
+    except Exception as exc:
+        log.debug("usage gate: could not read %s's plan: %s", provider, exc)
+        return None
 
 
 def _openrouter_get(path: str, key: str) -> Any:
@@ -174,7 +201,8 @@ def comment_held_cards(settings: Any, profiles: dict[str, tuple[str, str]], prov
                                            openrouter.get("balance_hold_usd", settings.openrouter["balance_hold_usd"]))
         else:
             episode = held_episode(providers[provider], model)
-            text = held_comment(settings.label(provider), held_windows(providers[provider], model), tz)
+            text = held_comment(settings.label(provider, providers[provider].get("plan")),
+                                held_windows(providers[provider], model), tz)
         if notes.get(card_id) != episode:
             result = _kanban("comment", card_id, "--author", "usage-gate", text)
             if result.returncode != 0:
@@ -461,7 +489,7 @@ def status_view() -> dict:
     plans = []
     for provider in sorted({p for p, _ in profiles.values()} | set(providers)):
         current = providers.get(provider) or {}
-        plans.append({"provider": provider, "label": settings.label(provider),
+        plans.append({"provider": provider, "label": settings.label(provider, current.get("plan")),
                       "thresholds": vars(settings.thresholds(provider)),
                       "bots": sorted(n for n, (p, _) in profiles.items() if p == provider and n != "default"),
                       "held_bots": sorted(n for n, (p, m) in profiles.items()
@@ -477,15 +505,21 @@ def status_view() -> dict:
             "timezone": getattr(tz, "key", None)}
 
 
+def plan_names() -> dict[str, str]:
+    """``{provider: plan}`` for every provider whose plan the gate has read."""
+    return {p: s["plan"] for p, s in (load_state().get("providers") or {}).items() if (s or {}).get("plan")}
+
+
 def interrupted_view(settings: Any) -> list[dict]:
     """The chats stopped by a plan limit in the last week, newest first, each with its title and plan label."""
-    rows = []
+    rows, plans = [], plan_names()
     for entry in load_interruptions().values():
         try:
             title = session_title(entry["profile"], entry["session_id"])
         except Exception:
             title = ""
-        rows.append({**entry, "title": title, "label": settings.label(entry.get("provider", ""))})
+        provider = entry.get("provider", "")
+        rows.append({**entry, "title": title, "label": settings.label(provider, plans.get(provider))})
     return sorted(rows, key=lambda e: e.get("interrupted_at", ""), reverse=True)
 
 
@@ -507,7 +541,7 @@ def token_usage(days: Optional[float] = None, now: Optional[datetime] = None) ->
     own turns; the other tasks are side tasks (title generation, compression, vision, the background review…)."""
     import sqlite3
     cutoff = (now or utcnow()).timestamp() - days * 86400 if days else 0
-    settings = read_settings()
+    settings, plans = read_settings(), plan_names()
     rows = []
     for profile, home in _profile_homes().items():
         if not (home / "state.db").exists():
@@ -524,7 +558,7 @@ def token_usage(days: Optional[float] = None, now: Optional[datetime] = None) ->
             continue
         for task, model, provider, *counts in found:
             rows.append({"bot": profile, "task": task, "model": model, "provider": provider,
-                         "label": settings.label(provider),
+                         "label": settings.label(provider, plans.get(provider)),
                          **{k: int(v or 0) for k, v in zip(TOKEN_COLUMNS, counts)}})
     rows.sort(key=lambda r: (r["bot"], r["task"] != "main", r["task"], r["model"]))
     return {"days": days, "rows": rows}

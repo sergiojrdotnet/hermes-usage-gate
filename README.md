@@ -82,11 +82,15 @@ usage_gate:
     key_warn_percent: 80
   providers:              # optional per-provider overrides
     openai-codex:
-      label: ChatGPT Plus # the plan's name in held-card comments (default: the provider id)
+      label: ChatGPT      # the plan's name when the provider doesn't report one (default: the provider id)
       session_percent: 85
 ```
 
 Reset times in comments use the config's `timezone` when it is set, UTC otherwise.
+
+Each plan is named after what its account reports: the plan in Codex's usage reply (`ChatGPT Prolite`), and the Claude
+subscription's account profile (`Claude Max 5x`), so an upgrade shows on the next check. `label` names a plan whose
+provider reports nothing, and the last plan read stays while its usage can't be read.
 
 A window that limits only one model family (Claude Max's "Fable week", say) counts only when one of that provider's
 bots runs that model, and when it crosses its threshold it holds only the bots on that family: the plan's other bots keep

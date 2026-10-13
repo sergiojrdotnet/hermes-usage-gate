@@ -1,6 +1,8 @@
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,8 +17,8 @@ NO_CARDS = mock.patch.object(runtime, "_kanban", return_value=SimpleNamespace(re
 T = Thresholds(session_percent=70, week_percent=80)
 
 
-def snapshot(*windows, unavailable=None):
-    return SimpleNamespace(unavailable_reason=unavailable, windows=tuple(
+def snapshot(*windows, unavailable=None, plan=None):
+    return SimpleNamespace(unavailable_reason=unavailable, plan=plan, windows=tuple(
         SimpleNamespace(label=label, used_percent=used, reset_at=None, scope=scope) for label, used, scope in windows))
 
 
@@ -54,6 +56,28 @@ class ReadingTest(unittest.TestCase):
         self.assertEqual(r.error, "usage API returned HTTP 429")
         self.assertEqual(r.windows, ())
 
+    def test_the_reported_plan_is_named_after_its_product(self):
+        week = ("Weekly", 0, "account")
+        self.assertEqual(gate.reading_from_snapshot("openai-codex", snapshot(week, plan="Prolite"), NOW).plan,
+                         "ChatGPT Prolite")
+        self.assertEqual(gate.reading_from_snapshot("openai-codex", snapshot(week, plan="ChatGPT Plus"), NOW).plan,
+                         "ChatGPT Plus")
+        self.assertEqual(gate.reading_from_snapshot("nous", snapshot(week, plan="Pro"), NOW).plan, "nous Pro")
+        self.assertIsNone(gate.reading_from_snapshot("openai-codex", snapshot(week), NOW).plan)
+
+
+class ClaudePlanTest(unittest.TestCase):
+    def test_organization_type_and_tier(self):
+        profile = {"organization": {"organization_type": "claude_max", "rate_limit_tier": "default_claude_max_5x"}}
+        self.assertEqual(gate.claude_plan(profile), "Claude Max 5x")
+        self.assertEqual(gate.claude_plan({"organization": {"organization_type": "claude_pro"}}), "Claude Pro")
+
+    def test_account_flags_when_the_organization_says_nothing(self):
+        self.assertEqual(gate.claude_plan({"organization": {}, "account": {"has_claude_max": True}}), "Claude Max")
+        self.assertEqual(gate.claude_plan({"account": {"has_claude_pro": True}}), "Claude Pro")
+        self.assertIsNone(gate.claude_plan({"account": {}}))
+        self.assertIsNone(gate.claude_plan("not a profile"))
+
 
 class DecideTest(unittest.TestCase):
     def reading(self, *windows, at=NOW):
@@ -82,6 +106,16 @@ class DecideTest(unittest.TestCase):
         state = gate.decide(later, T, paused, timedelta(minutes=30))
         self.assertEqual(state["decision"], OPEN)
         self.assertIn("429", state["reason"])
+
+    def test_the_plan_is_kept_until_a_reading_names_another(self):
+        named = Reading("p", NOW, windows=({"label": "Weekly", "kind": "week", "used_percent": 1},), plan="ChatGPT Pro")
+        state = gate.decide(named, T, None, timedelta(minutes=30))
+        unnamed = Reading("p", NOW, windows=named.windows)
+        self.assertEqual(gate.decide(unnamed, T, state, timedelta(minutes=30))["plan"], "ChatGPT Pro")
+        self.assertEqual(gate.decide(Reading("p", NOW, error="429"), T, state, timedelta(minutes=30))["plan"],
+                         "ChatGPT Pro")
+        renamed = Reading("p", NOW, windows=named.windows, plan="ChatGPT Prolite")
+        self.assertEqual(gate.decide(renamed, T, state, timedelta(minutes=30))["plan"], "ChatGPT Prolite")
 
     def test_unknown_with_no_history_is_open(self):
         self.assertEqual(gate.decide(Reading("p", NOW, error="x"), T, None, timedelta(minutes=30))["decision"], OPEN)
@@ -205,6 +239,10 @@ class CommentTextTest(unittest.TestCase):
         self.assertFalse(s.comment_held_cards)
         self.assertEqual((s.label("claude"), s.label("other")), ("Claude Pro", "other"))
 
+    def test_a_detected_plan_wins_over_the_configured_label(self):
+        s = gate.settings_from({"providers": {"claude": {"label": "Claude Pro"}}})
+        self.assertEqual((s.label("claude", "Claude Max 5x"), s.label("claude", None)), ("Claude Max 5x", "Claude Pro"))
+
 
 class HeldCardsTest(unittest.TestCase):
     profiles = {"ceo": ("codex", "astra"), "cto": ("claude", "opus"), "web": ("claude", "opus")}
@@ -231,6 +269,21 @@ class HeldCardsTest(unittest.TestCase):
         kept, comments = self.run_sweep({})
         self.assertEqual(sorted(comments), ["t_1", "t_3"])
         self.assertEqual(kept, {"t_1": "E1", "t_3": "E1"})
+
+    def test_the_comment_names_the_detected_plan(self):
+        texts = []
+
+        def kanban(*args):
+            if args[0] == "list":
+                return SimpleNamespace(returncode=0, stderr="",
+                                       stdout=json.dumps([{"id": "t_1", "assignee": "cto"}] if args[2] == "ready" else []))
+            texts.append(args[-1])
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        providers = {**self.paused, "claude": {**self.paused["claude"], "plan": "Claude Max 5x"}}
+        with mock.patch.object(runtime, "_kanban", side_effect=kanban), mock.patch.object(runtime, "_timezone", return_value=None):
+            runtime.comment_held_cards(gate.settings_from(None), self.profiles, providers, {})
+        self.assertIn("Claude Max 5x session at 90%", texts[0])
 
     def test_no_second_comment_in_the_same_pause(self):
         _, comments = self.run_sweep({"t_1": "E1", "t_3": "E1"})
@@ -288,6 +341,58 @@ class StatusViewTest(RuntimeTest):
         self.assertEqual(plans["claude"]["thresholds"], {"session_percent": 70, "week_percent": 80})
         self.assertEqual(view["held"], [{"id": "t_1", "title": "Fix CI", "assignee": "cto", "status": "ready"}])
         self.assertEqual(view["timezone"], None)
+
+    def test_plans_are_labelled_with_the_detected_plan(self):
+        (Path(os.environ["USAGE_GATE_HERMES_ROOT"]) / "config.yaml").write_text(
+            "usage_gate:\n  providers:\n    claude:\n      label: Claude Pro\n    openai-codex:\n      label: ChatGPT Plus\n")
+        runtime.save_state({"checked_at": NOW.isoformat(), "applied": None,
+                            "providers": {"claude": {"decision": OPEN, "plan": "Claude Max 5x"},
+                                          "openai-codex": {"decision": OPEN}}})
+        with NO_CARDS:
+            plans = {p["provider"]: p["label"] for p in runtime.status_view()["plans"]}
+        self.assertEqual(plans, {"claude": "Claude Max 5x", "openai-codex": "ChatGPT Plus"})
+
+
+class FetchPlanTest(RuntimeTest):
+    CLAUDE = "claude-subscription-directsdk-experimental"
+
+    def fetch(self, provider, snap, profile_plan):
+        with mock.patch("agent.account_usage.fetch_account_usage", return_value=snap), \
+             mock.patch.object(runtime, "claude_profile_plan", return_value=profile_plan) as lookup:
+            return runtime.fetch(provider, ["opus"]), lookup
+
+    def test_claude_asks_its_profile_for_the_plan(self):
+        reading, lookup = self.fetch(self.CLAUDE, snapshot(("Current week", 3, "account")), "Claude Max 5x")
+        self.assertEqual(reading.plan, "Claude Max 5x")
+        lookup.assert_called_once_with(self.CLAUDE)
+
+    def test_a_plan_in_the_usage_reply_needs_no_lookup(self):
+        reading, lookup = self.fetch("openai-codex", snapshot(("Weekly", 0, "account"), plan="Prolite"), "unused")
+        self.assertEqual(reading.plan, "ChatGPT Prolite")
+        lookup.assert_not_called()
+
+    def test_other_providers_are_not_looked_up(self):
+        reading, lookup = self.fetch("nous", snapshot(("Weekly", 0, "account")), "unused")
+        self.assertIsNone(reading.plan)
+        lookup.assert_not_called()
+
+    def test_profile_lookup_uses_the_plugins_own_token(self):
+        plugin = types.ModuleType("fake_claude_plugin")
+        plugin._subscription_token = lambda: ("tok", None)
+        profile = type("Profile", (), {"__module__": "fake_claude_plugin"})()
+        reply = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {
+            "organization": {"organization_type": "claude_max", "rate_limit_tier": "default_claude_max_20x"}})
+        with mock.patch.dict(sys.modules, {"fake_claude_plugin": plugin}), \
+             mock.patch("providers.get_provider_profile", return_value=profile), \
+             mock.patch("httpx.get", return_value=reply) as get:
+            self.assertEqual(runtime.claude_profile_plan(self.CLAUDE), "Claude Max 20x")
+        self.assertEqual(get.call_args.kwargs["headers"]["Authorization"], "Bearer tok")
+
+    def test_a_failed_profile_lookup_names_no_plan(self):
+        with mock.patch("providers.get_provider_profile", return_value=None):
+            self.assertIsNone(runtime.claude_profile_plan(self.CLAUDE))
+        with mock.patch("providers.get_provider_profile", side_effect=RuntimeError("no registry")):
+            self.assertIsNone(runtime.claude_profile_plan(self.CLAUDE))
 
 
 class ConcurrentRefreshTest(RuntimeTest):
@@ -480,10 +585,11 @@ class InterruptedChatTest(RuntimeTest):
 
     def test_status_view_lists_it_with_its_title(self):
         self.stop()
+        runtime.save_state({"providers": {"claude": {"decision": OPEN, "plan": "Claude Max 5x"}}})
         with NO_CARDS:
             view = runtime.status_view()
-        self.assertEqual([(c["profile"], c["title"], c["status"]) for c in view["interrupted"]],
-                         [("cto", "First 1:1", "waiting")])
+        self.assertEqual([(c["profile"], c["title"], c["status"], c["label"]) for c in view["interrupted"]],
+                         [("cto", "First 1:1", "waiting", "Claude Max 5x")])
 
 
 class TokenUsageTest(RuntimeTest):
@@ -519,6 +625,8 @@ class TokenUsageTest(RuntimeTest):
         (Path(os.environ["USAGE_GATE_HERMES_ROOT"]) / "config.yaml").write_text(
             "usage_gate:\n  providers:\n    claude:\n      label: Claude Pro\n")
         self.assertEqual({r["label"] for r in runtime.token_usage(7, now=NOW)["rows"]}, {"Claude Pro"})
+        runtime.save_state({"providers": {"claude": {"decision": OPEN, "plan": "Claude Max 5x"}}})
+        self.assertEqual({r["label"] for r in runtime.token_usage(7, now=NOW)["rows"]}, {"Claude Max 5x"})
 
     def test_all_time_includes_old_sessions(self):
         main = runtime.token_usage(None, now=NOW)["rows"][0]

@@ -59,8 +59,9 @@ class Settings:
         return Thresholds(override.get("session_percent", self.default.session_percent),
                           override.get("week_percent", self.default.week_percent))
 
-    def label(self, provider: str) -> str:
-        return self.labels.get(provider, provider)
+    def label(self, provider: str, detected: Optional[str] = None) -> str:
+        """The plan the provider reports, else its configured label, else its id."""
+        return detected or self.labels.get(provider, provider)
 
 
 def _number(value: Any, fallback: float) -> float:
@@ -122,6 +123,32 @@ def model_family(text: Any) -> Optional[str]:
     return match.group(1).lower() if match else None
 
 
+PLAN_PRODUCTS = {"openai-codex": "ChatGPT"}
+
+
+def product_plan(provider: str, plan: Any) -> Optional[str]:
+    """The plan a usage reply names, prefixed with its product (``Prolite`` is ``ChatGPT Prolite``)."""
+    plan = str(plan or "").strip()
+    if not plan:
+        return None
+    product = PLAN_PRODUCTS.get(provider, provider)
+    return plan if plan.lower().startswith(product.lower()) else f"{product} {plan}"
+
+
+def claude_plan(profile: Any) -> Optional[str]:
+    """A Claude account profile's plan and its usage tier: ``Claude Max 5x``, ``Claude Pro``."""
+    if not isinstance(profile, dict):
+        return None
+    organization, account = profile.get("organization") or {}, profile.get("account") or {}
+    kind = str(organization.get("organization_type") or "").lower().removeprefix("claude_")
+    if not kind:
+        kind = "max" if account.get("has_claude_max") else "pro" if account.get("has_claude_pro") else ""
+    if not kind:
+        return None
+    tier = re.search(r"_(\d+x)$", str(organization.get("rate_limit_tier") or ""))
+    return " ".join(["Claude", kind.replace("_", " ").title()] + ([tier.group(1)] if tier else []))
+
+
 def window_kind(label: str) -> Optional[str]:
     text = (label or "").lower()
     if "week" in text:
@@ -138,6 +165,7 @@ class Reading:
     at: datetime
     windows: tuple[dict, ...] = ()
     error: Optional[str] = None
+    plan: Optional[str] = None
 
 
 def reading_from_snapshot(provider: str, snapshot: Any, now: datetime, models: Iterable[str] = ()) -> Reading:
@@ -146,8 +174,9 @@ def reading_from_snapshot(provider: str, snapshot: Any, now: datetime, models: I
     snapshot calls it account- or model-scoped, its label naming a family is what decides."""
     if snapshot is None:
         return Reading(provider, now, error="no usage returned")
+    plan = product_plan(provider, getattr(snapshot, "plan", None))
     if getattr(snapshot, "unavailable_reason", None):
-        return Reading(provider, now, error=str(snapshot.unavailable_reason))
+        return Reading(provider, now, error=str(snapshot.unavailable_reason), plan=plan)
     in_use = {model_family(m) for m in models if m} - {None}
     names = [m.lower() for m in models if m]
     windows = []
@@ -166,8 +195,8 @@ def reading_from_snapshot(provider: str, snapshot: Any, now: datetime, models: I
         windows.append({"label": label, "kind": kind, "used_percent": float(used), "model": family,
                         "resets_at": reset.isoformat() if reset else None})
     if not windows:
-        return Reading(provider, now, error="no session or weekly window in the usage reply")
-    return Reading(provider, now, windows=tuple(windows))
+        return Reading(provider, now, error="no session or weekly window in the usage reply", plan=plan)
+    return Reading(provider, now, windows=tuple(windows), plan=plan)
 
 
 def over_threshold(reading: Reading, thresholds: Thresholds) -> list[dict]:
@@ -199,6 +228,9 @@ def decide(reading: Reading, thresholds: Thresholds, previous: Optional[dict], h
         families = sorted({w["model"] for w in over if w.get("model")})
         state = {"decision": PAUSED if account else OPEN, "last_reading_at": now, "checked_at": now,
                  "windows": list(reading.windows), "over": over, "paused_models": families}
+        plan = reading.plan or previous.get("plan")
+        if plan:
+            state["plan"] = plan
         if account:
             state["paused_since"] = previous.get("paused_since") if was_paused else now
             state["reason"] = _describe(account)

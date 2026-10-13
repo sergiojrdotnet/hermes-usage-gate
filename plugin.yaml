@@ -1,6 +1,6 @@
 manifest_version: 2
 name: hermes-usage-gate
-version: 0.10.0
+version: 0.11.0
 description: "Hold back new board cards for a provider's bots while that provider's plan usage is above configurable thresholds, resume the chats a plan limit stopped once it is back, show the tokens each bot used, and watch OpenRouter credits, with a read-only Desktop and dashboard page for its status."
 homepage: "https://github.com/sergiojrdotnet/hermes-usage-gate"
 provides_hooks:
