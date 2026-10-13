@@ -473,6 +473,11 @@ class TokenUsageTest(RuntimeTest):
         self.assertEqual([(r["bot"], r["task"], r["model"], r["calls"], r["input"], r["cache_read"]) for r in rows],
                          [("cto", "main", "opus", 15, 110, 1100), ("cto", "title_generation", "haiku", 1, 500, 0)])
 
+    def test_rows_carry_the_plan_label(self):
+        (Path(os.environ["USAGE_GATE_HERMES_ROOT"]) / "config.yaml").write_text(
+            "usage_gate:\n  providers:\n    claude:\n      label: Claude Pro\n")
+        self.assertEqual({r["label"] for r in runtime.token_usage(7, now=NOW)["rows"]}, {"Claude Pro"})
+
     def test_all_time_includes_old_sessions(self):
         main = runtime.token_usage(None, now=NOW)["rows"][0]
         self.assertEqual((main["calls"], main["output"]), (114, 10054))

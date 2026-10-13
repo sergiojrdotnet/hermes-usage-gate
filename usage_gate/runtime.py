@@ -457,6 +457,7 @@ def token_usage(days: Optional[float] = None, now: Optional[datetime] = None) ->
     own turns; the other tasks are side tasks (title generation, compression, vision, the background review…)."""
     import sqlite3
     cutoff = (now or utcnow()).timestamp() - days * 86400 if days else 0
+    settings = read_settings()
     rows = []
     for profile, home in _profile_homes().items():
         if not (home / "state.db").exists():
@@ -473,6 +474,7 @@ def token_usage(days: Optional[float] = None, now: Optional[datetime] = None) ->
             continue
         for task, model, provider, *counts in found:
             rows.append({"bot": profile, "task": task, "model": model, "provider": provider,
+                         "label": settings.label(provider),
                          **{k: int(v or 0) for k, v in zip(TOKEN_COLUMNS, counts)}})
     rows.sort(key=lambda r: (r["bot"], r["task"] != "main", r["task"], r["model"]))
     return {"days": days, "rows": rows}

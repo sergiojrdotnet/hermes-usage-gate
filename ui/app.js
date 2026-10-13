@@ -128,7 +128,7 @@ function createUsageGate(React, api) {
 
   const PERIODS = [['1', 'Last 24 h'], ['7', 'Last 7 days'], ['30', 'Last 30 days'], ['all', 'All time']]
   const TOKEN_COLUMNS = [['calls', 'Calls'], ['input', 'Input'], ['cache_read', 'Cache read'], ['cache_write', 'Cache write'],
-    ['output', 'Output'], ['reasoning', 'Reasoning']]
+    ['output', 'Output'], ['reasoning', 'Of which reasoning']]
 
   function compact(n) {
     if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e7 ? 1 : 2)}M`
@@ -142,8 +142,44 @@ function createUsageGate(React, api) {
     return text.charAt(0).toUpperCase() + text.slice(1)
   }
 
+  const SEGMENTS = [['cache_read', 'Cache read', C.accent], ['input', 'Input', C.green],
+    ['cache_write', 'Cache write', C.orange], ['output', 'Output', C.red]]
+
+  function ModelChart({ rows }) {
+    const models = []
+    rows.forEach(row => {
+      const key = `${row.model}\u0000${row.provider}`
+      let m = models.find(x => x.key === key)
+      if (!m) models.push(m = { key, model: row.model, label: row.label || row.provider, calls: 0, reasoning: 0,
+        ...Object.fromEntries(SEGMENTS.map(([k]) => [k, 0])) })
+      m.calls += row.calls
+      m.reasoning += row.reasoning
+      SEGMENTS.forEach(([k]) => { m[k] += row[k] })
+    })
+    models.forEach(m => { m.total = SEGMENTS.reduce((sum, [k]) => sum + m[k], 0) })
+    models.sort((a, b) => b.total - a.total)
+    const max = Math.max(1, ...models.map(m => m.total))
+    return h('div', { style: { ...s.card, marginBottom: 12 } },
+      h('div', { style: { ...s.row, marginBottom: 10, gap: 14 } }, SEGMENTS.map(([k, label, color]) =>
+        h('span', { key: k, style: { ...s.row, gap: 5, ...s.note } },
+          h('span', { style: { width: 10, height: 10, borderRadius: 2, background: color, display: 'inline-block' } }), label))),
+      models.map((m, i) => h('div', { key: m.key, style: { marginBottom: i === models.length - 1 ? 0 : 10 } },
+        h('div', { style: { ...s.row, justifyContent: 'space-between' } },
+          h('span', null, h('span', { style: s.mono }, m.model), h('span', { style: s.note }, ` · ${m.label}`)),
+          h('span', { style: { fontVariantNumeric: 'tabular-nums' }, title: `${m.total.toLocaleString()} tokens` },
+            `${compact(m.total)} tokens · ${m.calls} call${m.calls === 1 ? '' : 's'}`)),
+        h('div', { style: { display: 'flex', height: 12, borderRadius: 3, overflow: 'hidden', background: C.track,
+          width: `${Math.max(1, (m.total / max) * 100)}%`, marginTop: 3 } },
+          SEGMENTS.map(([k, label, color]) => m[k] > 0 && h('div', { key: k,
+            title: `${label}: ${m[k].toLocaleString()}${k === 'output' && m.reasoning ? ` (reasoning ${m.reasoning.toLocaleString()})` : ''}`,
+            style: { width: `${(m[k] / m.total) * 100}%`, minWidth: 2, background: color } }))),
+        h('div', { style: s.note }, SEGMENTS.filter(([k]) => m[k] > 0).map(([k, label]) =>
+          `${label} ${compact(m[k])}${k === 'output' && m.reasoning ? ` (reasoning ${compact(m.reasoning)})` : ''}`).join(' · ')))))
+  }
+
   function Tokens() {
     const [period, setPeriod] = useState('7')
+    const [bot, setBot] = useState('')
     const [data, setData] = useState(null)
     const [error, setError] = useState(null)
     useEffect(() => {
@@ -153,38 +189,49 @@ function createUsageGate(React, api) {
         .catch(err => alive && setError(errorText(err)))
       return () => { alive = false }
     }, [period])
+    const allRows = data ? data.rows : []
+    const botNames = [...new Set(allRows.map(r => r.bot))]
+    const rows = bot ? allRows.filter(r => r.bot === bot) : allRows
     const bots = []
-    ;(data ? data.rows : []).forEach(row => {
-      let bot = bots.find(b => b.name === row.bot)
-      if (!bot) bots.push(bot = { name: row.bot, rows: [], total: Object.fromEntries(TOKEN_COLUMNS.map(([k]) => [k, 0])) })
-      bot.rows.push(row)
-      TOKEN_COLUMNS.forEach(([k]) => { bot.total[k] += row[k] })
+    rows.forEach(row => {
+      let entry = bots.find(b => b.name === row.bot)
+      if (!entry) bots.push(entry = { name: row.bot, rows: [], total: Object.fromEntries(TOKEN_COLUMNS.map(([k]) => [k, 0])) })
+      entry.rows.push(row)
+      TOKEN_COLUMNS.forEach(([k]) => { entry.total[k] += row[k] })
     })
     const cells = (values, extra) => TOKEN_COLUMNS.map(([k]) => h('td', { key: k, title: values[k].toLocaleString(),
       style: { ...s.td, ...extra, textAlign: 'right', fontVariantNumeric: 'tabular-nums' } }, compact(values[k])))
     return h('div', null,
-      h('div', { style: { ...s.row, marginBottom: 8 } }, PERIODS.map(([value, label]) =>
-        h('button', { key: value, type: 'button', onClick: () => setPeriod(value),
-          style: s.button(period === value ? C.accent : null, period === value) }, label))),
+      h('div', { style: { ...s.row, marginBottom: 8 } },
+        PERIODS.map(([value, label]) =>
+          h('button', { key: value, type: 'button', onClick: () => setPeriod(value),
+            style: s.button(period === value ? C.accent : null, period === value) }, label)),
+        h('select', { value: bot, onChange: e => setBot(e.target.value), 'aria-label': 'Bot',
+          style: { ...s.button(), marginLeft: 8, background: 'transparent', color: C.text } },
+          h('option', { value: '' }, 'All bots'),
+          [...new Set([...botNames, ...(bot ? [bot] : [])])].map(name => h('option', { key: name, value: name }, name)))),
       error && h('div', { style: s.error }, error),
       !data && !error && h('div', { style: s.note }, 'Loading…'),
-      data && !bots.length && h('div', { style: s.empty }, 'No model calls in this period.'),
-      bots.length > 0 && h('table', { style: s.table },
+      data && !rows.length && h('div', { style: s.empty }, bot ? `No model calls by ${bot} in this period.` : 'No model calls in this period.'),
+      rows.length > 0 && h(ModelChart, { rows }),
+      bots.length > 0 && h('div', { style: { overflowX: 'auto' } }, h('table', { style: s.table },
         h('thead', null, h('tr', null,
           ['Bot', 'Task', 'Model'].map(t => h('th', { key: t, style: s.th }, t)),
           TOKEN_COLUMNS.map(([k, label]) => h('th', { key: k, style: { ...s.th, textAlign: 'right' } }, label)))),
-        h('tbody', null, bots.flatMap(bot => [
-          ...bot.rows.map((row, i) => h('tr', { key: `${bot.name}:${row.task}:${row.model}:${row.provider}` },
-            h('td', { style: s.td }, i === 0 ? bot.name : ''),
+        h('tbody', null, bots.flatMap(entry => [
+          ...entry.rows.map((row, i) => h('tr', { key: `${entry.name}:${row.task}:${row.model}:${row.provider}` },
+            h('td', { style: s.td }, i === 0 ? entry.name : ''),
             h('td', { style: s.td }, taskLabel(row.task)),
             h('td', { style: { ...s.td, ...s.mono } }, row.model),
             cells(row))),
-          bot.rows.length > 1 && h('tr', { key: `${bot.name}:total` },
+          entry.rows.length > 1 && h('tr', { key: `${entry.name}:total` },
             h('td', { style: s.td }), h('td', { style: { ...s.td, fontWeight: 600 }, colSpan: 2 }, 'Total'),
-            cells(bot.total, { fontWeight: 600 }))
-        ]))),
+            cells(entry.total, { fontWeight: 600 }))
+        ])))),
       h('div', { style: { ...s.note, marginTop: 8 } },
-        'A session counts in the period it started. Not recorded by Hermes: curator runs, Honcho’s own model calls, and calls that failed.'))
+        'Every model call sends the whole conversation again; the part the provider already holds is billed as a cache read, ' +
+        'which is why cache reads dwarf output. Reasoning is part of output. A session counts in the period it started. ' +
+        'Not recorded by Hermes: curator runs, Honcho’s own model calls, and calls that failed.'))
   }
 
   function SettingsSummary({ settings, plans }) {
