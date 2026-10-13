@@ -90,8 +90,8 @@ hermes usage-gate tokens --days 7   # tokens per bot, side task and model (omit 
 A **Usage Gate** page in the Hermes Desktop (Capabilities → Plugins → Install from Git, Desktop target) and a tab
 in the dashboard show each plan's session and weekly usage against its thresholds, whether the board may start its
 bots' cards, when each window resets, the cards being held, the chats a plan limit stopped this week and
-what became of each, the tokens used (a chart per model, then a table per bot, task and model, for the last 24 h, 7 days,
-30 days or all time, for every bot or one), and the settings in force. The page never changes
+what became of each, a chart of the tokens each model used (last 24 h, 7 days, 30 days or all time, for every bot or one),
+and the settings in force. The split per side task is in `hermes usage-gate tokens` and `GET /tokens/{days|all}`. The page never changes
 the settings; edit them in `config.yaml`. **Check now** re-reads usage and applies the result. In the Desktop,
 the status bar names any paused plan.
 
