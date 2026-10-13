@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from usage_gate.gate import (RESUME, WAIT, Reading, allowlist, decide, held_comment, held_episode, held_windows,
-                             holds, is_limit_error, openrouter_state, reading_from_snapshot, resume_action, settings_from,
-                             utcnow)
+                             holds, is_limit_error, openrouter_held_comment, openrouter_state, reading_from_snapshot,
+                             resume_action, settings_from, utcnow)
 
 log = logging.getLogger("hermes_usage_gate")
 CHAT_PLATFORMS = ("desktop", "tui", "cli")
@@ -103,12 +103,14 @@ def refresh_openrouter(settings: Any, previous: Optional[dict]) -> Optional[dict
     if not config["enabled"] or not key:
         return None
     workspace = config["workspace_id"]
+    hold = timedelta(minutes=settings.hold_minutes)
     try:
         credits = _openrouter_get("/credits", key)
         keys = _openrouter_get("/keys" + (f"?workspace_id={workspace}" if workspace else ""), key)
     except Exception as exc:
-        return openrouter_state(None, None, config, utcnow(), error=f"could not read OpenRouter: {exc}", previous=previous)
-    return openrouter_state(credits, keys, config, utcnow())
+        return openrouter_state(None, None, config, utcnow(), error=f"could not read OpenRouter: {exc}",
+                                previous=previous, hold=hold)
+    return openrouter_state(credits, keys, config, utcnow(), previous=previous, hold=hold)
 
 
 def _run_hermes(*args: str) -> subprocess.CompletedProcess:
@@ -153,11 +155,12 @@ def _timezone() -> Any:
 
 
 def comment_held_cards(settings: Any, profiles: dict[str, tuple[str, str]], providers: dict[str, dict],
-                       notes: dict[str, str]) -> dict[str, str]:
+                       notes: dict[str, str], openrouter: Optional[dict] = None) -> dict[str, str]:
     """Leave one comment per held card per pause, so the board shows why it isn't starting.
     Returns ``{card id: pause it was told about}`` for the cards still held."""
+    holding_all = bool((openrouter or {}).get("holding"))
     held = {name: (provider, model) for name, (provider, model) in profiles.items()
-            if holds(providers.get(provider), model)}
+            if holding_all or holds(providers.get(provider), model)}
     if not held:
         return {}
     tz = _timezone()
@@ -165,9 +168,14 @@ def comment_held_cards(settings: Any, profiles: dict[str, tuple[str, str]], prov
     for card in held_cards(set(held)):
         card_id = str(card.get("id"))
         provider, model = held[card["assignee"]]
-        episode = held_episode(providers[provider], model)
-        if notes.get(card_id) != episode:
+        if holding_all:
+            episode = f"openrouter:{openrouter.get('held_since', '')}"
+            text = openrouter_held_comment(settings.openrouter["label"], openrouter.get("balance", 0.0),
+                                           openrouter.get("balance_hold_usd", settings.openrouter["balance_hold_usd"]))
+        else:
+            episode = held_episode(providers[provider], model)
             text = held_comment(settings.label(provider), held_windows(providers[provider], model), tz)
+        if notes.get(card_id) != episode:
             result = _kanban("comment", card_id, "--author", "usage-gate", text)
             if result.returncode != 0:
                 log.warning("usage gate: could not comment on %s: %s", card_id, result.stderr.strip()[-200:])
@@ -268,8 +276,11 @@ def on_api_request_error(session_id: str = "", platform: str = "", provider: str
             return
         if not is_limit_error(status_code, reason, error):
             return
+        profile = _profile_of(session_id)
+        if is_room_session(profile, session_id):
+            return
         message = error.get("message", "") if isinstance(error, dict) else str(error or "")
-        record_interruption(_profile_of(session_id), session_id, provider, platform, message, model=str(model or ""))
+        record_interruption(profile, session_id, provider, platform, message, model=str(model or ""))
     except Exception:
         log.exception("usage gate: could not record an interrupted chat")
 
@@ -307,6 +318,12 @@ def _profile_of(session_id: str) -> str:
         except Exception:
             continue
     return guess
+
+
+def is_room_session(profile: str, session_id: str) -> bool:
+    """A bot's turn in a Desktop group chat runs in a hidden session titled "Group: …". The room engine owns those
+    turns, so a resume from here would answer where nobody reads it."""
+    return session_title(profile, session_id).startswith("Group:")
 
 
 def session_title(profile: str, session_id: str) -> str:
@@ -402,16 +419,20 @@ def refresh(force: bool = False) -> dict:
                 if (previous or {}).get("decision") != providers[provider]["decision"]:
                     log.warning("usage gate: %s is now %s (%s)", provider, providers[provider]["decision"],
                                 providers[provider]["reason"])
-            wanted = allowlist(profiles, providers)
+            openrouter = refresh_openrouter(settings, state.get("openrouter"))
+            holding = bool((openrouter or {}).get("holding"))
+            if holding != bool((state.get("openrouter") or {}).get("holding")):
+                log.warning("usage gate: OpenRouter balance %s every bot's cards",
+                            "is low, holding" if holding else "is back, releasing")
+            wanted = allowlist(profiles, providers, hold_all=holding)
         else:
-            wanted = None
+            openrouter, wanted = None, None
         applied = apply_allowlist(wanted, applied)
         notes = state.get("held_notes") or {}
         if settings.enabled and settings.comment_held_cards:
-            notes = comment_held_cards(settings, profiles, providers, notes)
+            notes = comment_held_cards(settings, profiles, providers, notes, openrouter)
         if settings.enabled and settings.resume_interrupted_chats:
             resume_interrupted_chats(settings, providers)
-        openrouter = refresh_openrouter(settings, state.get("openrouter")) if settings.enabled else None
         state = {"checked_at": now.isoformat(), "enabled": settings.enabled, "settings": settings_view(settings),
                  "providers": providers, "applied": applied, "held_notes": notes, "openrouter": openrouter}
         save_state(state)
@@ -446,7 +467,8 @@ def status_view() -> dict:
                       "held_bots": sorted(n for n, (p, m) in profiles.items()
                                           if p == provider and n != "default" and holds(current, m)),
                       **current})
-    paused = {n for n, (p, m) in profiles.items() if holds(providers.get(p), m)}
+    holding_all = bool((state.get("openrouter") or {}).get("holding"))
+    paused = {n for n, (p, m) in profiles.items() if holding_all or holds(providers.get(p), m)}
     held = [{k: c.get(k) for k in ("id", "title", "assignee", "status")} for c in held_cards(paused)] if paused else []
     tz = _timezone()
     return {"settings": settings_view(settings), "checked_at": state.get("checked_at"), "plans": plans,

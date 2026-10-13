@@ -21,7 +21,7 @@ DEFAULTS = {
     "resume_within_hours": 12.0,
     "providers": {},
     "openrouter": {"enabled": True, "key_env": "OPENROUTER_MANAGEMENT_KEY", "workspace_id": "", "label": "OpenRouter",
-                   "balance_warn_usd": 2.0, "key_warn_percent": 80.0},
+                   "balance_warn_usd": 2.0, "balance_hold_usd": 2.0, "key_warn_percent": 80.0},
 }
 
 RESUME = "resume"
@@ -107,6 +107,7 @@ def _openrouter_settings(raw: Any) -> dict:
             "workspace_id": str(raw.get("workspace_id") or ""),
             "label": str(raw.get("label") or base["label"]),
             "balance_warn_usd": max(0.0, _number(raw.get("balance_warn_usd"), base["balance_warn_usd"])),
+            "balance_hold_usd": max(0.0, _number(raw.get("balance_hold_usd"), base["balance_hold_usd"])),
             "key_warn_percent": max(1.0, _number(raw.get("key_warn_percent"), base["key_warn_percent"]))}
 
 
@@ -254,8 +255,11 @@ def held_comment(label: str, over: list[dict], tz: Optional[Any] = None) -> str:
     return text + " This card starts on its own once usage is back under the threshold; nothing to do."
 
 
-def allowlist(profiles: dict[str, tuple[str, str]], states: dict[str, dict]) -> Optional[list[str]]:
-    """Profiles the board may start, from ``{profile: (provider, model)}``, or None when nobody is held."""
+def allowlist(profiles: dict[str, tuple[str, str]], states: dict[str, dict], hold_all: bool = False) -> Optional[list[str]]:
+    """Profiles the board may start, from ``{profile: (provider, model)}``, or None when nobody is held.
+    ``hold_all`` holds every profile: an empty allowlist, which the board reads as nobody."""
+    if hold_all:
+        return []
     held = {name for name, (provider, model) in profiles.items() if holds(states.get(provider), model)}
     if not held:
         return None
@@ -295,14 +299,23 @@ def resume_action(entry: dict, provider_state: Optional[dict], now: datetime, wi
 
 
 def openrouter_state(credits: Optional[dict], keys: Optional[list], settings: dict, now: datetime,
-                     error: Optional[str] = None, previous: Optional[dict] = None) -> dict:
-    """OpenRouter's balance and each key's spend, with the warnings to show. OpenRouter is watched, never gated:
-    no bot runs on it. When it can't be read, the last numbers stay and the error is shown next to them."""
+                     error: Optional[str] = None, previous: Optional[dict] = None,
+                     hold: timedelta = timedelta(0)) -> dict:
+    """OpenRouter's balance and each key's spend, with the warnings to show. No bot runs on OpenRouter, but the
+    company's memory service does, so a balance under ``balance_hold_usd`` holds every bot's cards (``holding``;
+    ``held_since`` marks the episode). When it can't be read, the last numbers stay with the error next to them,
+    and a hold lasts ``hold`` after the last good reading, like a plan's pause."""
     at = now.isoformat()
+    previous = previous or {}
     if error:
-        return {**(previous or {}), "checked_at": at, "error": error}
+        state = {**previous, "checked_at": at, "error": error}
+        last = previous.get("last_reading_at")
+        if previous.get("holding") and not (last and now - datetime.fromisoformat(last) < hold):
+            state = {k: v for k, v in state.items() if k != "held_since"} | {"holding": False}
+        return state
     total, used = _number((credits or {}).get("total_credits"), 0.0), _number((credits or {}).get("total_usage"), 0.0)
     balance = total - used
+    holding = settings["balance_hold_usd"] > 0 and balance < settings["balance_hold_usd"]
     warnings = []
     if balance < settings["balance_warn_usd"]:
         warnings.append(f"Balance ${balance:.2f} is under ${settings['balance_warn_usd']:.2f}")
@@ -320,5 +333,16 @@ def openrouter_state(credits: Optional[dict], keys: Optional[list], settings: di
         if percent is not None and percent >= settings["key_warn_percent"]:
             period = f" {key['limit_reset']}" if key.get("limit_reset") else ""
             warnings.append(f"Key {name} at {percent:.0f}% of its ${_number(limit, 0.0):.2f}{period} limit")
-    return {"checked_at": at, "last_reading_at": at, "balance": balance, "total_credits": total, "total_usage": used,
-            "balance_warn_usd": settings["balance_warn_usd"], "keys": rows, "warnings": warnings, "error": None}
+    state = {"checked_at": at, "last_reading_at": at, "balance": balance, "total_credits": total, "total_usage": used,
+             "balance_warn_usd": settings["balance_warn_usd"], "balance_hold_usd": settings["balance_hold_usd"],
+             "holding": holding, "keys": rows, "warnings": warnings, "error": None}
+    if holding:
+        state["held_since"] = previous.get("held_since") if previous.get("holding") else at
+    return state
+
+
+def openrouter_held_comment(label: str, balance: float, hold_usd: float) -> str:
+    """The comment left on a card held because the OpenRouter balance is low."""
+    return (f"Held by the usage gate: the {label} balance is ${balance:.2f}, under ${hold_usd:.2f}, and the company's "
+            "memory service runs on it, so every bot's cards wait. Adding credit is a founder decision. This card "
+            "starts on its own once the balance is back over the limit.")

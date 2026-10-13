@@ -118,14 +118,18 @@
 
     function OpenRouter({ data, label }) {
       const warned = (data.warnings || []).length > 0
-      const badge = data.error && !data.last_reading_at ? { label: 'Unreadable', color: C.muted }
+      const badge = data.holding ? { label: 'Holding every card', color: C.red }
+        : data.error && !data.last_reading_at ? { label: 'Unreadable', color: C.muted }
         : warned ? { label: 'Warning', color: C.orange } : { label: 'OK', color: C.green }
       const usedShare = data.total_credits ? Math.min(100, (100 * data.total_usage) / data.total_credits) : 0
       return h('div', { style: s.card },
         h('div', { style: { ...s.row, justifyContent: 'space-between' } },
           h('strong', null, label),
           h('span', { style: s.badge(badge.color) }, badge.label)),
-        h('div', { style: { ...s.note, margin: '2px 0 10px' } }, 'Watched, never gated: no bot runs on it.'),
+        h('div', { style: { ...s.note, margin: '2px 0 10px' } },
+          data.holding ? `The balance is under ${usd(data.balance_hold_usd)}: every bot's cards wait until credit is added.`
+            : data.balance_hold_usd ? `The memory service runs on it: a balance under ${usd(data.balance_hold_usd)} holds every bot's cards.`
+              : 'Watched only: no bot runs on it.'),
         data.last_reading_at && h('div', { style: { marginBottom: 10 } },
           h('div', { style: { ...s.row, justifyContent: 'space-between' } },
             h('span', null, 'Credits'),
@@ -271,6 +275,7 @@
       ]
       const openrouter = settings.openrouter || {}
       if (openrouter.enabled) {
+        rows.push([`${openrouter.label || 'OpenRouter'}: hold every card when the balance is under`, usd(openrouter.balance_hold_usd)])
         rows.push([`${openrouter.label || 'OpenRouter'}: warn when the balance is under`, usd(openrouter.balance_warn_usd)])
         rows.push([`${openrouter.label || 'OpenRouter'}: warn when a key reaches`, `${Math.round(Number(openrouter.key_warn_percent))}% of its limit`])
       }

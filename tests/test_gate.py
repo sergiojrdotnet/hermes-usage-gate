@@ -152,6 +152,18 @@ class RuntimeTest(unittest.TestCase):
             state = runtime.refresh(force=True)
         self.assertIsNone(state["applied"])
 
+    def test_a_low_openrouter_balance_holds_every_bot(self):
+        open_reading = lambda p, m: Reading(p, NOW, windows=({"label": "Session", "kind": "session", "used_percent": 5},))
+        low = {"checked_at": NOW.isoformat(), "last_reading_at": NOW.isoformat(), "balance": 1.5, "holding": True,
+               "held_since": NOW.isoformat(), "balance_hold_usd": 2.0}
+        calls = []
+        with mock.patch.object(runtime, "fetch", side_effect=open_reading), NO_CARDS, \
+             mock.patch.object(runtime, "refresh_openrouter", return_value=low), \
+             mock.patch.object(runtime, "_hermes", side_effect=lambda *a: calls.append(a) or SimpleNamespace(returncode=0, stderr="")):
+            state = runtime.refresh(force=True)
+        self.assertEqual(state["applied"], [])
+        self.assertEqual(calls, [("set", "kanban.dispatch_profiles", "[]")])
+
     def test_refresh_skips_until_due(self):
         runtime.save_state({"checked_at": NOW.isoformat(), "applied": None})
         with mock.patch.object(runtime, "utcnow", return_value=NOW + timedelta(minutes=2)), \
@@ -228,6 +240,26 @@ class HeldCardsTest(unittest.TestCase):
         providers = {**self.paused, "claude": {**self.paused["claude"], "paused_since": "E2"}}
         _, comments = self.run_sweep({"t_1": "E1", "t_3": "E1"}, providers)
         self.assertEqual(sorted(comments), ["t_1", "t_3"])
+
+    def test_an_openrouter_hold_comments_every_bots_cards_once(self):
+        holding = {"holding": True, "held_since": "H1", "balance": 1.5, "balance_hold_usd": 2.0}
+        cards = {"ready": [{"id": "t_1", "assignee": "cto"}, {"id": "t_2", "assignee": "ceo"}],
+                 "review": [{"id": "t_3", "assignee": "web"}]}
+        comments = []
+
+        def kanban(*args):
+            if args[0] == "list":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(cards[args[2]]), stderr="")
+            comments.append((args[1], args[-1]))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        open_plans = {"claude": {"decision": OPEN}, "codex": {"decision": OPEN}}
+        with mock.patch.object(runtime, "_kanban", side_effect=kanban), mock.patch.object(runtime, "_timezone", return_value=None):
+            kept = runtime.comment_held_cards(gate.settings_from(None), self.profiles, open_plans, {}, holding)
+            again = runtime.comment_held_cards(gate.settings_from(None), self.profiles, open_plans, kept, holding)
+        self.assertEqual(sorted(c for c, _ in comments), ["t_1", "t_2", "t_3"])
+        self.assertIn("balance is $1.50, under $2.00", comments[0][1])
+        self.assertEqual(again, kept)
 
     def test_nothing_paused_lists_nothing(self):
         kept, comments = self.run_sweep({"t_1": "E1"}, {"claude": {"decision": OPEN}})
@@ -437,6 +469,15 @@ class InterruptedChatTest(RuntimeTest):
         self.assertEqual((self.entry()["resumes"], self.entry()["first_interrupted_at"]),
                          (0, (NOW + timedelta(days=2)).isoformat()))
 
+    def test_a_group_chat_turn_is_left_to_the_room(self):
+        self.db.execute("insert into sessions values (?, ?)", ("20261013_120000_aaaaaa", "Group: r1 · main"))
+        self.db.commit()
+        with mock.patch.object(runtime, "utcnow", return_value=NOW), \
+             mock.patch.object(runtime, "_current_profile", return_value="cto"):
+            runtime.on_api_request_error(session_id="20261013_120000_aaaaaa", platform="desktop", provider="claude",
+                                         **self.LIMIT)
+        self.assertEqual(runtime.load_interruptions(), {})
+
     def test_status_view_lists_it_with_its_title(self):
         self.stop()
         with NO_CARDS:
@@ -581,6 +622,32 @@ class OpenRouterTest(unittest.TestCase):
         good = gate.openrouter_state({"total_credits": 10, "total_usage": 0.16}, [self.KEY], self.SETTINGS, NOW)
         bad = gate.openrouter_state(None, None, self.SETTINGS, NOW + timedelta(minutes=10), error="HTTP 503", previous=good)
         self.assertEqual((bad["balance"], bad["error"], bad["last_reading_at"]), (good["balance"], "HTTP 503", NOW.isoformat()))
+
+    def test_a_balance_under_the_hold_limit_holds_until_it_is_back(self):
+        low = gate.openrouter_state({"total_credits": 10, "total_usage": 8.5}, [], self.SETTINGS, NOW)
+        lower = gate.openrouter_state({"total_credits": 10, "total_usage": 9}, [], self.SETTINGS,
+                                      NOW + timedelta(minutes=10), previous=low)
+        topped = gate.openrouter_state({"total_credits": 20, "total_usage": 9}, [], self.SETTINGS,
+                                       NOW + timedelta(minutes=20), previous=lower)
+        self.assertTrue(low["holding"] and lower["holding"])
+        self.assertEqual(lower["held_since"], low["held_since"])
+        self.assertFalse(topped["holding"])
+        self.assertNotIn("held_since", topped)
+
+    def test_an_unreadable_api_keeps_a_hold_only_for_the_hold_window(self):
+        low = gate.openrouter_state({"total_credits": 10, "total_usage": 8.5}, [], self.SETTINGS, NOW)
+        kept = gate.openrouter_state(None, None, self.SETTINGS, NOW + timedelta(minutes=10), error="HTTP 503",
+                                     previous=low, hold=timedelta(minutes=30))
+        released = gate.openrouter_state(None, None, self.SETTINGS, NOW + timedelta(minutes=40), error="HTTP 503",
+                                         previous=kept, hold=timedelta(minutes=30))
+        self.assertTrue(kept["holding"])
+        self.assertFalse(released["holding"])
+
+    def test_a_zero_hold_limit_only_watches(self):
+        settings = gate.settings_from({"openrouter": {"balance_hold_usd": 0}}).openrouter
+        state = gate.openrouter_state({"total_credits": 10, "total_usage": 10}, [], settings, NOW)
+        self.assertFalse(state["holding"])
+        self.assertEqual(gate.allowlist({"cto": ("claude", "opus")}, {}, hold_all=True), [])
 
     def test_settings_defaults_and_bounds(self):
         o = gate.settings_from({"openrouter": {"balance_warn_usd": -5, "key_warn_percent": 0}}).openrouter

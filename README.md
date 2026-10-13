@@ -22,7 +22,8 @@ card starts as soon as a check finds usage back under the threshold, which can b
 When a chat (Desktop, TUI or CLI) stops because its model call hit the plan's limit, the gate notes it. Once a
 check finds that plan open again, it sends the chat one message, by default *"The plan limit has reset; continue
 where you stopped."*, so the bot picks up where it was. It runs as a one-shot `hermes chat --resume` in the
-background; its output goes to `~/.hermes/usage-gate/resume-logs/`.
+background; its output goes to `~/.hermes/usage-gate/resume-logs/`. A bot's turn in a Desktop group chat is left to
+the room, which runs its own retries: a resume from here would answer where nobody reads it.
 
 A chat is left alone when you wrote in it after it stopped, when the bot already answered (the note Hermes leaves
 for a failed turn doesn't count), or when `resume_within_hours` have passed since it first stopped. A resume that
@@ -46,10 +47,16 @@ on its own models.
 
 When the environment holds an OpenRouter management key (`OPENROUTER_MANAGEMENT_KEY` by default), each check also reads
 the account's credits and every key's spend, and the page shows them next to the plans: credits spent of those bought,
-the balance, and each key's spend today, this week and this month against its limit. OpenRouter is watched, never gated,
-since no bot runs on it (a memory service such as Honcho may). The page and the Desktop status bar warn when the balance
-drops under `balance_warn_usd` or a key reaches `key_warn_percent` of its limit. When OpenRouter can't be read, the
-last numbers stay and the error is shown next to them.
+the balance, and each key's spend today, this week and this month against its limit. No bot runs on OpenRouter, but a
+memory service such as Honcho may, so a balance under `balance_hold_usd` holds every bot's cards (an empty allowlist)
+and comments once on each held card, until credit is added; `0` only watches. The page and the Desktop status bar warn
+when the balance drops under `balance_warn_usd` or a key reaches `key_warn_percent` of its limit. When OpenRouter can't
+be read, the last numbers stay with the error next to them, and a hold lasts `hold_minutes` after the last good reading.
+
+## Desktop notifications
+
+Besides the page and the status-bar notice, the Desktop shows a system notification when a plan or a model's own window
+pauses, when the OpenRouter hold starts, and when either opens again.
 
 ## Settings
 
@@ -70,6 +77,7 @@ usage_gate:
     key_env: OPENROUTER_MANAGEMENT_KEY
     workspace_id: ""      # list only this workspace's keys
     label: OpenRouter
+    balance_hold_usd: 2   # hold every bot's cards under this balance; 0 only watches
     balance_warn_usd: 2
     key_warn_percent: 80
   providers:              # optional per-provider overrides

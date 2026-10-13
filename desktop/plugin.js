@@ -109,14 +109,18 @@ function createUsageGate(React, api) {
 
   function OpenRouter({ data, label }) {
     const warned = (data.warnings || []).length > 0
-    const badge = data.error && !data.last_reading_at ? { label: 'Unreadable', color: C.muted }
+    const badge = data.holding ? { label: 'Holding every card', color: C.red }
+      : data.error && !data.last_reading_at ? { label: 'Unreadable', color: C.muted }
       : warned ? { label: 'Warning', color: C.orange } : { label: 'OK', color: C.green }
     const usedShare = data.total_credits ? Math.min(100, (100 * data.total_usage) / data.total_credits) : 0
     return h('div', { style: s.card },
       h('div', { style: { ...s.row, justifyContent: 'space-between' } },
         h('strong', null, label),
         h('span', { style: s.badge(badge.color) }, badge.label)),
-      h('div', { style: { ...s.note, margin: '2px 0 10px' } }, 'Watched, never gated: no bot runs on it.'),
+      h('div', { style: { ...s.note, margin: '2px 0 10px' } },
+        data.holding ? `The balance is under ${usd(data.balance_hold_usd)}: every bot's cards wait until credit is added.`
+          : data.balance_hold_usd ? `The memory service runs on it: a balance under ${usd(data.balance_hold_usd)} holds every bot's cards.`
+            : 'Watched only: no bot runs on it.'),
       data.last_reading_at && h('div', { style: { marginBottom: 10 } },
         h('div', { style: { ...s.row, justifyContent: 'space-between' } },
           h('span', null, 'Credits'),
@@ -262,6 +266,7 @@ function createUsageGate(React, api) {
     ]
     const openrouter = settings.openrouter || {}
     if (openrouter.enabled) {
+      rows.push([`${openrouter.label || 'OpenRouter'}: hold every card when the balance is under`, usd(openrouter.balance_hold_usd)])
       rows.push([`${openrouter.label || 'OpenRouter'}: warn when the balance is under`, usd(openrouter.balance_warn_usd)])
       rows.push([`${openrouter.label || 'OpenRouter'}: warn when a key reaches`, `${Math.round(Number(openrouter.key_warn_percent))}% of its limit`])
     }
@@ -325,6 +330,36 @@ function createUsageGate(React, api) {
   }
 }
 
+function pauses(status) {
+  const found = {}
+  for (const plan of status.plans || []) {
+    if (plan.decision === 'paused') {
+      found[`plan:${plan.provider}:${plan.paused_since || ''}`] = {
+        title: `Usage Gate: ${plan.label} paused`,
+        body: `${plan.reason || 'Usage is over its threshold'}. Its bots' cards wait until usage is back under it.`,
+        reopened: `${plan.label} is open again; its held cards start on their own.`
+      }
+    }
+    for (const family of plan.paused_models || []) {
+      found[`model:${plan.provider}:${family}:${(plan.model_paused_since || {})[family] || ''}`] = {
+        title: `Usage Gate: ${plan.label} ${family} paused`,
+        body: `Bots on ${family} wait for its own limit; the rest of ${plan.label} keeps working.`,
+        reopened: `${family} on ${plan.label} is open again; its held cards start on their own.`
+      }
+    }
+  }
+  const openrouter = status.openrouter || {}
+  if (openrouter.holding) {
+    const label = (status.settings.openrouter || {}).label || 'OpenRouter'
+    found[`openrouter:${openrouter.held_since || ''}`] = {
+      title: 'Usage Gate: every card held',
+      body: `The ${label} balance is $${Number(openrouter.balance || 0).toFixed(2)}, under $${Number(openrouter.balance_hold_usd || 0).toFixed(2)}. Cards start again once credit is added.`,
+      reopened: `The ${label} balance is back over its limit; held cards start on their own.`
+    }
+  }
+  return found
+}
+
 function PausedPlans({ ctx }) {
   const [paused, setPaused] = React.useState([])
   React.useEffect(() => {
@@ -333,7 +368,8 @@ function PausedPlans({ ctx }) {
       .then(r => alive && setPaused([
         ...r.plans.filter(p => p.decision === 'paused' || (p.paused_models || []).length)
           .map(p => `⏸ ${p.decision === 'paused' ? p.label : `${p.label} (${p.paused_models.join(', ')})`} paused`),
-        ...((r.openrouter && (r.openrouter.warnings || []).length) ? [`⚠ ${(r.settings.openrouter || {}).label || 'OpenRouter'} low`] : [])]))
+        ...(r.openrouter && r.openrouter.holding ? [`⏸ All cards held: ${(r.settings.openrouter || {}).label || 'OpenRouter'} low`]
+          : (r.openrouter && (r.openrouter.warnings || []).length) ? [`⚠ ${(r.settings.openrouter || {}).label || 'OpenRouter'} low`] : [])]))
       .catch(() => {})
     load()
     const timer = setInterval(load, 60000)
@@ -363,5 +399,21 @@ export default {
       { id: 'open', area: PALETTE_AREA, data: { id: `${ID}.open`, label: 'Open Usage Gate', run: () => host.navigate(ROUTE) } },
       { id: 'paused', area: STATUSBAR_AREAS.right, order: 121, render: () => React.createElement(PausedPlans, { ctx }) }
     ])
+
+    let known = null
+    const poll = () => ctx.rest('/status').then(status => {
+      const now = pauses(status)
+      if (known) {
+        for (const [key, pause] of Object.entries(now)) {
+          if (!known[key]) ctx.os.notify({ title: pause.title, body: pause.body, activate: ROUTE })
+        }
+        for (const [key, pause] of Object.entries(known)) {
+          if (!now[key]) ctx.os.notify({ title: 'Usage Gate: open again', body: pause.reopened, activate: ROUTE })
+        }
+      }
+      known = now
+    }).catch(() => {})
+    poll()
+    ctx.setInterval(poll, 60000)
   }
 }
