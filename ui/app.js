@@ -1,0 +1,198 @@
+function createUsageGate(React, api) {
+  const h = React.createElement
+  const { useCallback, useEffect, useState } = React
+
+  const C = {
+    text: 'var(--ui-text-primary, var(--color-foreground, currentColor))',
+    muted: 'var(--ui-text-secondary, var(--color-muted-foreground, #8a8f98))',
+    border: 'var(--ui-stroke-secondary, var(--color-border, rgba(128, 128, 128, 0.28)))',
+    track: 'var(--ui-stroke-tertiary, rgba(128, 128, 128, 0.18))',
+    accent: 'var(--ui-accent, var(--color-primary, #4f7cff))',
+    green: 'var(--ui-green, #2e9d5b)',
+    orange: 'var(--ui-orange, #e08a1e)',
+    red: 'var(--ui-red, #d64545)'
+  }
+  const DECISIONS = {
+    open: { label: 'Open', color: C.green },
+    paused: { label: 'Paused', color: C.red }
+  }
+
+  const s = {
+    page: { padding: '20px 24px', color: C.text, fontSize: 13, lineHeight: 1.45, maxWidth: 1180 },
+    header: { display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap', marginBottom: 4 },
+    title: { fontSize: 18, fontWeight: 600, margin: 0 },
+    note: { color: C.muted, fontSize: 12 },
+    section: { fontSize: 14, fontWeight: 600, margin: '22px 0 10px' },
+    cards: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 12 },
+    card: { border: `1px solid ${C.border}`, borderRadius: 8, padding: '12px 14px' },
+    row: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' },
+    badge: color => ({ display: 'inline-block', padding: '1px 8px', borderRadius: 999, fontSize: 11, fontWeight: 600,
+      color, border: `1px solid ${color}`, whiteSpace: 'nowrap' }),
+    button: (tone, solid) => ({ padding: '4px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12,
+      border: `1px solid ${tone || C.border}`, background: solid ? tone : 'transparent', color: solid ? '#fff' : tone || C.text }),
+    input: { padding: '4px 7px', borderRadius: 6, border: `1px solid ${C.border}`, background: 'transparent',
+      color: C.text, fontSize: 12, width: 84 },
+    table: { width: '100%', borderCollapse: 'collapse' },
+    th: { textAlign: 'left', fontWeight: 500, color: C.muted, padding: '6px 8px', borderBottom: `1px solid ${C.border}`, fontSize: 12 },
+    td: { padding: '7px 8px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' },
+    mono: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 },
+    error: { color: C.red, fontSize: 12, margin: '8px 0' },
+    ok: { color: C.green, fontSize: 12, margin: '8px 0' },
+    warn: { color: C.orange, fontSize: 12 },
+    empty: { color: C.muted, padding: '14px 0' }
+  }
+
+  function ago(iso) {
+    if (!iso) return 'never'
+    const seconds = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000)
+    if (seconds < 90) return 'just now'
+    if (seconds < 5400) return `${Math.round(seconds / 60)} min ago`
+    if (seconds < 129600) return `${Math.round(seconds / 3600)} h ago`
+    return `${Math.round(seconds / 86400)} d ago`
+  }
+
+  function when(iso) {
+    return iso ? new Date(iso).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : ''
+  }
+
+  function errorText(error) {
+    return String(error && error.message || error)
+  }
+
+  function Bar({ used, threshold, color }) {
+    return h('div', { style: { position: 'relative', height: 8, borderRadius: 4, background: C.track, margin: '4px 0' } },
+      h('div', { style: { width: `${Math.min(100, used)}%`, height: '100%', borderRadius: 4, background: color } }),
+      h('div', { title: `Threshold ${threshold}%`, style: { position: 'absolute', top: -3, bottom: -3, left: `${threshold}%`,
+        width: 2, background: C.text, opacity: 0.6 } }))
+  }
+
+  function Plan({ plan, refreshMinutes }) {
+    const decision = DECISIONS[plan.decision] || { label: 'No reading yet', color: C.muted }
+    const stale = plan.last_reading_at && Date.now() - new Date(plan.last_reading_at).getTime() > refreshMinutes * 2 * 60000
+    const windows = plan.windows || []
+    return h('div', { style: s.card },
+      h('div', { style: { ...s.row, justifyContent: 'space-between' } },
+        h('strong', null, plan.label),
+        h('span', { style: s.badge(decision.color) }, decision.label)),
+      h('div', { style: { ...s.note, margin: '2px 0 10px' } }, plan.bots.length ? plan.bots.join(', ') : 'No bots on this plan'),
+      windows.length ? windows.map(w => {
+        const threshold = w.kind === 'session' ? plan.thresholds.session_percent : plan.thresholds.week_percent
+        const over = w.used_percent >= threshold
+        return h('div', { key: w.label, style: { marginBottom: 10 } },
+          h('div', { style: { ...s.row, justifyContent: 'space-between' } },
+            h('span', null, w.label),
+            h('span', { style: { color: over ? C.red : C.text, fontVariantNumeric: 'tabular-nums' } },
+              `${Math.round(w.used_percent)}% of ${threshold}%`)),
+          h(Bar, { used: w.used_percent, threshold, color: over ? C.red : C.accent }),
+          w.resets_at && h('div', { style: s.note }, `Resets ${when(w.resets_at)}`))
+      }) : h('div', { style: s.note }, 'No usage reading yet.'),
+      plan.reason && h('div', { style: { ...s.note, marginTop: 6 } }, plan.reason),
+      h('div', { style: s.note }, `Last good reading ${ago(plan.last_reading_at)}`),
+      stale && h('div', { style: s.warn }, 'The latest checks could not read this plan; the last decision is being kept.'))
+  }
+
+  function Held({ cards }) {
+    if (!cards.length) return h('div', { style: s.empty }, 'No cards are being held.')
+    return h('table', { style: s.table },
+      h('thead', null, h('tr', null, ['Card', 'Title', 'Bot', 'Column'].map(t => h('th', { key: t, style: s.th }, t)))),
+      h('tbody', null, cards.map(c => h('tr', { key: c.id },
+        h('td', { style: { ...s.td, ...s.mono } }, c.id),
+        h('td', { style: s.td }, c.title),
+        h('td', { style: s.td }, c.assignee),
+        h('td', { style: s.td }, c.status === 'review' ? 'Review' : 'Ready')))))
+  }
+
+  function NumberField({ label, value, onChange, placeholder, suffix }) {
+    return h('label', { style: { ...s.row, gap: 6 } },
+      h('span', { style: { minWidth: 150 } }, label),
+      h('input', { type: 'number', value: value === undefined || value === null ? '' : value, placeholder,
+        onChange: e => onChange(e.target.value), style: s.input }),
+      suffix && h('span', { style: s.note }, suffix))
+  }
+
+  function Check({ label, checked, onChange }) {
+    return h('label', { style: { ...s.row, gap: 6 } },
+      h('input', { type: 'checkbox', checked, onChange: e => onChange(e.target.checked) }), label)
+  }
+
+  function Settings({ settings, plans, onSaved }) {
+    const [form, setForm] = useState(settings)
+    const [message, setMessage] = useState(null)
+    const [saving, setSaving] = useState(false)
+    useEffect(() => { setForm(settings) }, [JSON.stringify(settings)])
+    const set = (key, value) => setForm({ ...form, [key]: value })
+    const setPlan = (provider, key, value) => {
+      const providers = { ...(form.providers || {}) }
+      providers[provider] = { ...(providers[provider] || {}), [key]: value }
+      setForm({ ...form, providers })
+    }
+    const save = () => {
+      setSaving(true)
+      setMessage(null)
+      api.post('/settings', form)
+        .then(status => { setMessage({ ok: 'Saved. The gate re-checked usage with the new settings.' }); onSaved(status) })
+        .catch(error => setMessage({ error: errorText(error) }))
+        .finally(() => setSaving(false))
+    }
+    return h('div', { style: { ...s.card, display: 'grid', gap: 8, maxWidth: 640 } },
+      h(Check, { label: 'Gate enabled', checked: form.enabled !== false, onChange: v => set('enabled', v) }),
+      h(Check, { label: 'Comment on held cards', checked: form.comment_held_cards !== false, onChange: v => set('comment_held_cards', v) }),
+      h(NumberField, { label: 'Session threshold', value: form.session_percent, onChange: v => set('session_percent', v), suffix: '%' }),
+      h(NumberField, { label: 'Weekly threshold', value: form.week_percent, onChange: v => set('week_percent', v), suffix: '%' }),
+      h(NumberField, { label: 'Check every', value: form.refresh_minutes, onChange: v => set('refresh_minutes', v), suffix: 'minutes' }),
+      h(NumberField, { label: 'Keep a pause, when usage', value: form.hold_minutes, onChange: v => set('hold_minutes', v),
+        suffix: "minutes can't be read" }),
+      h('div', { style: { ...s.section, margin: '10px 0 0', fontSize: 13 } }, 'Per plan (blank = use the values above)'),
+      plans.map(plan => {
+        const own = (form.providers || {})[plan.provider] || {}
+        return h('div', { key: plan.provider, style: { ...s.row, gap: 10 } },
+          h('input', { value: own.label || '', placeholder: plan.provider, title: 'Name shown on this page and in card comments',
+            onChange: e => setPlan(plan.provider, 'label', e.target.value), style: { ...s.input, width: 150 } }),
+          h('input', { type: 'number', value: own.session_percent === undefined ? '' : own.session_percent,
+            placeholder: `session ${form.session_percent}`, onChange: e => setPlan(plan.provider, 'session_percent', e.target.value),
+            style: { ...s.input, width: 110 } }),
+          h('input', { type: 'number', value: own.week_percent === undefined ? '' : own.week_percent,
+            placeholder: `week ${form.week_percent}`, onChange: e => setPlan(plan.provider, 'week_percent', e.target.value),
+            style: { ...s.input, width: 110 } }))
+      }),
+      h('div', { style: s.row },
+        h('button', { type: 'button', onClick: save, disabled: saving, style: s.button(C.accent, true) }, saving ? 'Saving…' : 'Save'),
+        h('button', { type: 'button', onClick: () => { setForm(settings); setMessage(null) }, style: s.button() }, 'Reset')),
+      message && message.ok && h('div', { style: s.ok }, message.ok),
+      message && message.error && h('div', { style: s.error }, message.error))
+  }
+
+  return function UsageGate() {
+    const [status, setStatus] = useState(null)
+    const [error, setError] = useState(null)
+    const [checking, setChecking] = useState(false)
+    const load = useCallback(() => api.get('/status').then(data => { setStatus(data); setError(null) })
+      .catch(err => setError(errorText(err))), [])
+    useEffect(() => {
+      load()
+      const timer = setInterval(load, 30000)
+      return () => clearInterval(timer)
+    }, [load])
+    const check = () => {
+      setChecking(true)
+      api.post('/check').then(setStatus).catch(err => setError(errorText(err))).finally(() => setChecking(false))
+    }
+    if (!status) return h('div', { style: s.page }, error ? h('div', { style: s.error }, error) : h('div', { style: s.note }, 'Loading…'))
+    const paused = status.plans.filter(p => p.decision === 'paused')
+    return h('div', { style: s.page },
+      h('div', { style: s.header },
+        h('h1', { style: s.title }, 'Usage Gate'),
+        h('span', { style: s.badge(!status.settings.enabled ? C.muted : paused.length ? C.red : C.green) },
+          !status.settings.enabled ? 'Disabled' : paused.length ? `${paused.length} plan${paused.length > 1 ? 's' : ''} paused` : 'All plans open'),
+        h('span', { style: s.note }, `Checked ${ago(status.checked_at)} · every ${status.settings.refresh_minutes} min`),
+        h('button', { type: 'button', onClick: check, disabled: checking, style: s.button() }, checking ? 'Checking…' : 'Check now')),
+      h('div', { style: s.note }, 'New board cards for a plan’s bots wait while its usage is over a threshold. Chats, schedules, webhooks and email runs are never held.'),
+      error && h('div', { style: s.error }, error),
+      h('div', { style: s.section }, 'Plans'),
+      h('div', { style: s.cards }, status.plans.map(plan => h(Plan, { key: plan.provider, plan, refreshMinutes: status.settings.refresh_minutes }))),
+      h('div', { style: s.section }, 'Held cards'),
+      h(Held, { cards: status.held || [] }),
+      h('div', { style: s.section }, 'Settings'),
+      h(Settings, { settings: status.settings, plans: status.plans, onSaved: setStatus }))
+  }
+}

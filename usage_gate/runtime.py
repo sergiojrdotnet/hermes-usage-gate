@@ -10,7 +10,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
-from usage_gate.gate import PAUSED, Reading, allowlist, decide, held_comment, reading_from_snapshot, settings_from, utcnow
+from usage_gate.gate import (PAUSED, Reading, allowlist, decide, held_comment, reading_from_snapshot, settings_from,
+                             utcnow, validated_settings)
 
 log = logging.getLogger("hermes_usage_gate")
 _lock = threading.Lock()
@@ -191,18 +192,57 @@ def refresh(force: bool = False) -> dict:
         notes = state.get("held_notes") or {}
         if settings.enabled and settings.comment_held_cards:
             notes = comment_held_cards(settings, profiles, providers, notes)
-        state = {"checked_at": now.isoformat(), "enabled": settings.enabled,
-                 "thresholds": {"session_percent": settings.default.session_percent,
-                                "week_percent": settings.default.week_percent,
-                                "per_provider": {k: vars(v) for k, v in settings.per_provider.items()}},
+        state = {"checked_at": now.isoformat(), "enabled": settings.enabled, "settings": settings_view(settings),
                  "providers": providers, "applied": applied, "held_notes": notes}
         save_state(state)
         return state
 
 
-def on_dispatch_tick(**_: Any) -> None:
-    """Dispatcher hook: refresh in the background, so a slow usage API never delays a tick."""
-    if _running.is_set():
+def settings_view(settings: Any) -> dict:
+    return {"enabled": settings.enabled, "session_percent": settings.default.session_percent,
+            "week_percent": settings.default.week_percent, "refresh_minutes": settings.refresh_minutes,
+            "hold_minutes": settings.hold_minutes, "comment_held_cards": settings.comment_held_cards,
+            "providers": {p: {**settings.per_provider.get(p, {}),
+                              **({"label": settings.labels[p]} if p in settings.labels else {})}
+                          for p in sorted(set(settings.per_provider) | set(settings.labels))}}
+
+
+def status_view() -> dict:
+    """Everything the Usage Gate page shows: settings, each plan's last reading and decision, the bots on each
+    plan, the allowlist in force and the cards being held."""
+    settings = read_settings()
+    state = load_state()
+    profiles = profile_models()
+    providers = state.get("providers") or {}
+    plans = []
+    for provider in sorted({p for p, _ in profiles.values()} | set(providers)):
+        current = providers.get(provider) or {}
+        plans.append({"provider": provider, "label": settings.label(provider),
+                      "thresholds": vars(settings.thresholds(provider)),
+                      "bots": sorted(n for n, (p, _) in profiles.items() if p == provider and n != "default"),
+                      **current})
+    paused = {n for n, (p, _) in profiles.items() if (providers.get(p) or {}).get("decision") == PAUSED}
+    held = [{k: c.get(k) for k in ("id", "title", "assignee", "status")} for c in held_cards(paused)] if paused else []
+    tz = _timezone()
+    return {"settings": settings_view(settings), "checked_at": state.get("checked_at"), "plans": plans,
+            "allowlist": state.get("applied"), "held": held, "timezone": getattr(tz, "key", None)}
+
+
+def save_settings(body: dict) -> dict:
+    """Validate a settings form and write it as the default profile's ``usage_gate``; raises ValueError."""
+    new = validated_settings(body, {p for p, _ in profile_models().values()})
+    # --force replaces the whole section, so an override cleared in the form is removed from the config too.
+    result = _hermes("set", "--force", "usage_gate", json.dumps(new))
+    if result.returncode != 0:
+        raise ValueError(f"could not save settings: {result.stderr.strip()[-200:]}")
+    log.warning("usage gate: settings changed to %s", json.dumps(new))
+    return new
+
+
+def on_dispatch_tick(profile_name: Optional[str] = None, **_: Any) -> None:
+    """Dispatcher hook: refresh in the background, so a slow usage API never delays a tick. Only the default
+    profile's dispatcher drives the gate; the plugin is installed in other profiles for its page and API."""
+    if profile_name not in (None, "", "default") or _running.is_set():
         return
     _running.set()
 

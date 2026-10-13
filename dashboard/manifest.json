@@ -1,0 +1,14 @@
+{
+  "name": "hermes-usage-gate",
+  "label": "Usage Gate",
+  "description": "Each plan's usage, whether the board may start its bots' cards, the cards being held, and the gate's settings.",
+  "icon": "Gauge",
+  "version": "0.3.0",
+  "tab": {
+    "path": "/usage-gate",
+    "position": "after:config"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

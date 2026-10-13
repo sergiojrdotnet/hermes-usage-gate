@@ -31,12 +31,15 @@ class Settings:
     refresh_minutes: float
     hold_minutes: float
     default: Thresholds
-    per_provider: dict[str, Thresholds] = field(default_factory=dict)
+    per_provider: dict[str, dict] = field(default_factory=dict)
     comment_held_cards: bool = True
     labels: dict[str, str] = field(default_factory=dict)
 
     def thresholds(self, provider: str) -> Thresholds:
-        return self.per_provider.get(provider, self.default)
+        """The provider's own values where set, the defaults for the rest."""
+        override = self.per_provider.get(provider, {})
+        return Thresholds(override.get("session_percent", self.default.session_percent),
+                          override.get("week_percent", self.default.week_percent))
 
     def label(self, provider: str) -> str:
         return self.labels.get(provider, provider)
@@ -56,11 +59,14 @@ def settings_from(raw: Optional[dict]) -> Settings:
                          _number(raw.get("week_percent"), DEFAULTS["week_percent"]))
     per_provider, labels = {}, {}
     for name, values in (raw.get("providers") or {}).items():
-        if isinstance(values, dict):
-            per_provider[str(name)] = Thresholds(_number(values.get("session_percent"), default.session_percent),
-                                                 _number(values.get("week_percent"), default.week_percent))
-            if values.get("label"):
-                labels[str(name)] = str(values["label"])
+        if not isinstance(values, dict):
+            continue
+        override = {key: _number(values[key], getattr(default, key))
+                    for key in ("session_percent", "week_percent") if values.get(key) is not None}
+        if override:
+            per_provider[str(name)] = override
+        if values.get("label"):
+            labels[str(name)] = str(values["label"])
     return Settings(enabled=raw.get("enabled", DEFAULTS["enabled"]) is not False,
                     refresh_minutes=max(1.0, _number(raw.get("refresh_minutes"), DEFAULTS["refresh_minutes"])),
                     hold_minutes=max(0.0, _number(raw.get("hold_minutes"), DEFAULTS["hold_minutes"])),
@@ -182,3 +188,50 @@ def allowlist(profile_providers: dict[str, str], states: dict[str, dict]) -> Opt
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+_LIMITS = {"session_percent": (1, 100), "week_percent": (1, 100), "refresh_minutes": (1, 1440),
+           "hold_minutes": (0, 1440)}
+
+
+def _bounded(key: str, value: Any, optional: bool = False, field_name: str = "") -> Optional[float]:
+    if optional and (value is None or value == ""):
+        return None
+    name = field_name or key
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number") from None
+    low, high = _LIMITS[key]
+    if not low <= number <= high:
+        raise ValueError(f"{name} must be between {low} and {high}")
+    return int(number) if number.is_integer() else number
+
+
+def validated_settings(body: dict, providers_in_use: Iterable[str]) -> dict:
+    """The ``usage_gate`` config a settings form submits, checked; raises ValueError naming the bad field.
+    Per-provider entries are kept only for providers in use, and only with the keys actually set."""
+    if not isinstance(body, dict):
+        raise ValueError("settings must be an object")
+    result = {"enabled": body.get("enabled") is not False,
+              "comment_held_cards": body.get("comment_held_cards") is not False}
+    for name in ("session_percent", "week_percent", "refresh_minutes", "hold_minutes"):
+        result[name] = _bounded(name, body.get(name, DEFAULTS[name]))
+    providers = {}
+    in_use = set(providers_in_use)
+    for provider, values in (body.get("providers") or {}).items():
+        if provider not in in_use or not isinstance(values, dict):
+            continue
+        entry = {}
+        label = str(values.get("label") or "").strip()
+        if label:
+            entry["label"] = label[:60]
+        for name in ("session_percent", "week_percent"):
+            value = _bounded(name, values.get(name), optional=True, field_name=f"{provider} {name}")
+            if value is not None:
+                entry[name] = value
+        if entry:
+            providers[provider] = entry
+    if providers:
+        result["providers"] = providers
+    return result
