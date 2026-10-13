@@ -59,12 +59,12 @@ hermes usage-gate status   # settings, each plan's last reading and decision, he
 
 A **Usage Gate** page in the Hermes Desktop (Capabilities → Plugins → Install from Git, Desktop target) and a tab
 in the dashboard show each plan's session and weekly usage against its thresholds, whether the board may start its
-bots' cards, when each window resets, the cards being held, and a settings form. Saving the form validates it,
-replaces the `usage_gate` section and re-checks usage at once; **Check now** re-reads usage without changing
-anything. In the Desktop, the status bar names any paused plan.
+bots' cards, when each window resets, the cards being held, and the settings in force. The page never changes
+the settings; edit them in `config.yaml`. **Check now** re-reads usage and applies the result. In the Desktop,
+the status bar names any paused plan.
 
 The page is served by `dashboard/plugin_api.py` at `/api/plugins/hermes-usage-gate/` (`GET /status`,
-`POST /check`, `POST /settings`). After changing `ui/`, run `python3 build.py`.
+`POST /check`). After changing `ui/`, run `python3 build.py`.
 
 State is kept in `~/.hermes/usage-gate/state.json`.
 

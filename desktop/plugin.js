@@ -37,14 +37,11 @@ function createUsageGate(React, api) {
       color, border: `1px solid ${color}`, whiteSpace: 'nowrap' }),
     button: (tone, solid) => ({ padding: '4px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12,
       border: `1px solid ${tone || C.border}`, background: solid ? tone : 'transparent', color: solid ? '#fff' : tone || C.text }),
-    input: { padding: '4px 7px', borderRadius: 6, border: `1px solid ${C.border}`, background: 'transparent',
-      color: C.text, fontSize: 12, width: 84 },
     table: { width: '100%', borderCollapse: 'collapse' },
     th: { textAlign: 'left', fontWeight: 500, color: C.muted, padding: '6px 8px', borderBottom: `1px solid ${C.border}`, fontSize: 12 },
     td: { padding: '7px 8px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' },
     mono: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 },
     error: { color: C.red, fontSize: 12, margin: '8px 0' },
-    ok: { color: C.green, fontSize: 12, margin: '8px 0' },
     warn: { color: C.orange, fontSize: 12 },
     empty: { color: C.muted, padding: '14px 0' }
   }
@@ -109,64 +106,28 @@ function createUsageGate(React, api) {
         h('td', { style: s.td }, c.status === 'review' ? 'Review' : 'Ready')))))
   }
 
-  function NumberField({ label, value, onChange, placeholder, suffix }) {
-    return h('label', { style: { ...s.row, gap: 6 } },
-      h('span', { style: { minWidth: 150 } }, label),
-      h('input', { type: 'number', value: value === undefined || value === null ? '' : value, placeholder,
-        onChange: e => onChange(e.target.value), style: s.input }),
-      suffix && h('span', { style: s.note }, suffix))
-  }
-
-  function Check({ label, checked, onChange }) {
-    return h('label', { style: { ...s.row, gap: 6 } },
-      h('input', { type: 'checkbox', checked, onChange: e => onChange(e.target.checked) }), label)
-  }
-
-  function Settings({ settings, plans, onSaved }) {
-    const [form, setForm] = useState(settings)
-    const [message, setMessage] = useState(null)
-    const [saving, setSaving] = useState(false)
-    useEffect(() => { setForm(settings) }, [JSON.stringify(settings)])
-    const set = (key, value) => setForm({ ...form, [key]: value })
-    const setPlan = (provider, key, value) => {
-      const providers = { ...(form.providers || {}) }
-      providers[provider] = { ...(providers[provider] || {}), [key]: value }
-      setForm({ ...form, providers })
-    }
-    const save = () => {
-      setSaving(true)
-      setMessage(null)
-      api.post('/settings', form)
-        .then(status => { setMessage({ ok: 'Saved. The gate re-checked usage with the new settings.' }); onSaved(status) })
-        .catch(error => setMessage({ error: errorText(error) }))
-        .finally(() => setSaving(false))
-    }
-    return h('div', { style: { ...s.card, display: 'grid', gap: 8, maxWidth: 640 } },
-      h(Check, { label: 'Gate enabled', checked: form.enabled !== false, onChange: v => set('enabled', v) }),
-      h(Check, { label: 'Comment on held cards', checked: form.comment_held_cards !== false, onChange: v => set('comment_held_cards', v) }),
-      h(NumberField, { label: 'Session threshold', value: form.session_percent, onChange: v => set('session_percent', v), suffix: '%' }),
-      h(NumberField, { label: 'Weekly threshold', value: form.week_percent, onChange: v => set('week_percent', v), suffix: '%' }),
-      h(NumberField, { label: 'Check every', value: form.refresh_minutes, onChange: v => set('refresh_minutes', v), suffix: 'minutes' }),
-      h(NumberField, { label: 'Keep a pause, when usage', value: form.hold_minutes, onChange: v => set('hold_minutes', v),
-        suffix: "minutes can't be read" }),
-      h('div', { style: { ...s.section, margin: '10px 0 0', fontSize: 13 } }, 'Per plan (blank = use the values above)'),
-      plans.map(plan => {
-        const own = (form.providers || {})[plan.provider] || {}
-        return h('div', { key: plan.provider, style: { ...s.row, gap: 10 } },
-          h('input', { value: own.label || '', placeholder: plan.provider, title: 'Name shown on this page and in card comments',
-            onChange: e => setPlan(plan.provider, 'label', e.target.value), style: { ...s.input, width: 150 } }),
-          h('input', { type: 'number', value: own.session_percent === undefined ? '' : own.session_percent,
-            placeholder: `session ${form.session_percent}`, onChange: e => setPlan(plan.provider, 'session_percent', e.target.value),
-            style: { ...s.input, width: 110 } }),
-          h('input', { type: 'number', value: own.week_percent === undefined ? '' : own.week_percent,
-            placeholder: `week ${form.week_percent}`, onChange: e => setPlan(plan.provider, 'week_percent', e.target.value),
-            style: { ...s.input, width: 110 } }))
-      }),
-      h('div', { style: s.row },
-        h('button', { type: 'button', onClick: save, disabled: saving, style: s.button(C.accent, true) }, saving ? 'Saving…' : 'Save'),
-        h('button', { type: 'button', onClick: () => { setForm(settings); setMessage(null) }, style: s.button() }, 'Reset')),
-      message && message.ok && h('div', { style: s.ok }, message.ok),
-      message && message.error && h('div', { style: s.error }, message.error))
+  function SettingsSummary({ settings, plans }) {
+    const pct = v => `${Math.round(Number(v))}%`
+    const rows = [
+      ['Gate', settings.enabled ? 'Enabled' : 'Disabled'],
+      ['Session threshold', pct(settings.session_percent)],
+      ['Weekly threshold', pct(settings.week_percent)],
+      ['Check every', `${settings.refresh_minutes} min`],
+      ["Keep a pause when usage can't be read", `${settings.hold_minutes} min`],
+      ['Comment on held cards', settings.comment_held_cards ? 'Yes' : 'No']
+    ]
+    plans.forEach(plan => {
+      const own = (settings.providers || {})[plan.provider] || {}
+      if (own.session_percent !== undefined || own.week_percent !== undefined) {
+        rows.push([`${plan.label} thresholds`, `session ${pct(plan.thresholds.session_percent)}, week ${pct(plan.thresholds.week_percent)}`])
+      }
+    })
+    return h('div', { style: { ...s.card, maxWidth: 640 } },
+      h('table', { style: s.table }, h('tbody', null, rows.map(([label, value]) => h('tr', { key: label },
+        h('td', { style: { ...s.td, color: C.muted, width: '55%' } }, label),
+        h('td', { style: s.td }, value))))),
+      h('div', { style: { ...s.note, marginTop: 8 } },
+        'Read-only. These live in the usage_gate section of the default profile’s Hermes config.'))
   }
 
   return function UsageGate() {
@@ -200,7 +161,7 @@ function createUsageGate(React, api) {
       h('div', { style: s.section }, 'Held cards'),
       h(Held, { cards: status.held || [] }),
       h('div', { style: s.section }, 'Settings'),
-      h(Settings, { settings: status.settings, plans: status.plans, onSaved: setStatus }))
+      h(SettingsSummary, { settings: status.settings, plans: status.plans }))
   }
 }
 

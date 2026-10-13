@@ -10,8 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
-from usage_gate.gate import (PAUSED, Reading, allowlist, decide, held_comment, reading_from_snapshot, settings_from,
-                             utcnow, validated_settings)
+from usage_gate.gate import PAUSED, Reading, allowlist, decide, held_comment, reading_from_snapshot, settings_from, utcnow
 
 log = logging.getLogger("hermes_usage_gate")
 _lock = threading.Lock()
@@ -226,17 +225,6 @@ def status_view() -> dict:
     tz = _timezone()
     return {"settings": settings_view(settings), "checked_at": state.get("checked_at"), "plans": plans,
             "allowlist": state.get("applied"), "held": held, "timezone": getattr(tz, "key", None)}
-
-
-def save_settings(body: dict) -> dict:
-    """Validate a settings form and write it as the default profile's ``usage_gate``; raises ValueError."""
-    new = validated_settings(body, {p for p, _ in profile_models().values()})
-    # --force replaces the whole section, so an override cleared in the form is removed from the config too.
-    result = _hermes("set", "--force", "usage_gate", json.dumps(new))
-    if result.returncode != 0:
-        raise ValueError(f"could not save settings: {result.stderr.strip()[-200:]}")
-    log.warning("usage gate: settings changed to %s", json.dumps(new))
-    return new
 
 
 def on_dispatch_tick(profile_name: Optional[str] = None, **_: Any) -> None:

@@ -233,27 +233,11 @@ class HeldCardsTest(unittest.TestCase):
         self.assertEqual((kept, comments), ({}, []))
 
 
-class SettingsFormTest(unittest.TestCase):
+class PlanOverrideTest(unittest.TestCase):
     def test_label_only_plan_inherits_later_threshold_changes(self):
         s = gate.settings_from({"session_percent": 60, "providers": {"claude": {"label": "Claude Pro"}}})
         self.assertEqual(s.thresholds("claude"), Thresholds(60, 80))
         self.assertNotIn("claude", s.per_provider)
-
-    def test_form_values_are_validated_and_typed(self):
-        new = gate.validated_settings({"enabled": True, "session_percent": "75", "week_percent": 90, "refresh_minutes": "10",
-                                       "hold_minutes": "30", "comment_held_cards": False,
-                                       "providers": {"claude": {"label": " Claude Pro ", "session_percent": "",
-                                                                "week_percent": "85"},
-                                                     "gone": {"label": "x"}}}, ["claude", "codex"])
-        self.assertEqual(new, {"enabled": True, "comment_held_cards": False, "session_percent": 75, "week_percent": 90,
-                               "refresh_minutes": 10, "hold_minutes": 30,
-                               "providers": {"claude": {"label": "Claude Pro", "week_percent": 85}}})
-
-    def test_out_of_range_names_the_field(self):
-        with self.assertRaisesRegex(ValueError, "week_percent must be between 1 and 100"):
-            gate.validated_settings({"week_percent": 120}, [])
-        with self.assertRaisesRegex(ValueError, "claude session_percent must be a number"):
-            gate.validated_settings({"providers": {"claude": {"session_percent": "high"}}}, ["claude"])
 
 
 class StatusViewTest(RuntimeTest):
@@ -271,13 +255,6 @@ class StatusViewTest(RuntimeTest):
         self.assertEqual(plans["claude"]["thresholds"], {"session_percent": 70, "week_percent": 80})
         self.assertEqual(view["held"], [{"id": "t_1", "title": "Fix CI", "assignee": "cto", "status": "ready"}])
         self.assertEqual(view["timezone"], None)
-
-    def test_save_settings_writes_default_profile_config(self):
-        calls = []
-        with mock.patch.object(runtime, "_hermes", side_effect=lambda *a: calls.append(a) or SimpleNamespace(returncode=0, stderr="")):
-            runtime.save_settings({"session_percent": 65, "week_percent": 85, "refresh_minutes": 10, "hold_minutes": 30})
-        self.assertEqual(calls[0][:3], ("set", "--force", "usage_gate"))
-        self.assertEqual(json.loads(calls[0][3])["session_percent"], 65)
 
 
 class HookGuardTest(unittest.TestCase):
