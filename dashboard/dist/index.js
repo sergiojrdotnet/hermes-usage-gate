@@ -142,6 +142,67 @@
         })))
     }
 
+    const PERIODS = [['1', 'Last 24 h'], ['7', 'Last 7 days'], ['30', 'Last 30 days'], ['all', 'All time']]
+    const TOKEN_COLUMNS = [['calls', 'Calls'], ['input', 'Input'], ['cache_read', 'Cache read'], ['cache_write', 'Cache write'],
+      ['output', 'Output'], ['reasoning', 'Reasoning']]
+
+    function compact(n) {
+      if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e7 ? 1 : 2)}M`
+      if (n >= 1e3) return `${(n / 1e3).toFixed(n >= 1e4 ? 0 : 1)}K`
+      return String(n)
+    }
+
+    function taskLabel(task) {
+      if (task === 'main') return 'Own work'
+      const text = task.replace(/_/g, ' ')
+      return text.charAt(0).toUpperCase() + text.slice(1)
+    }
+
+    function Tokens() {
+      const [period, setPeriod] = useState('7')
+      const [data, setData] = useState(null)
+      const [error, setError] = useState(null)
+      useEffect(() => {
+        let alive = true
+        setData(null)
+        api.get(`/tokens/${period}`).then(d => { if (alive) { setData(d); setError(null) } })
+          .catch(err => alive && setError(errorText(err)))
+        return () => { alive = false }
+      }, [period])
+      const bots = []
+      ;(data ? data.rows : []).forEach(row => {
+        let bot = bots.find(b => b.name === row.bot)
+        if (!bot) bots.push(bot = { name: row.bot, rows: [], total: Object.fromEntries(TOKEN_COLUMNS.map(([k]) => [k, 0])) })
+        bot.rows.push(row)
+        TOKEN_COLUMNS.forEach(([k]) => { bot.total[k] += row[k] })
+      })
+      const cells = (values, extra) => TOKEN_COLUMNS.map(([k]) => h('td', { key: k, title: values[k].toLocaleString(),
+        style: { ...s.td, ...extra, textAlign: 'right', fontVariantNumeric: 'tabular-nums' } }, compact(values[k])))
+      return h('div', null,
+        h('div', { style: { ...s.row, marginBottom: 8 } }, PERIODS.map(([value, label]) =>
+          h('button', { key: value, type: 'button', onClick: () => setPeriod(value),
+            style: s.button(period === value ? C.accent : null, period === value) }, label))),
+        error && h('div', { style: s.error }, error),
+        !data && !error && h('div', { style: s.note }, 'Loading…'),
+        data && !bots.length && h('div', { style: s.empty }, 'No model calls in this period.'),
+        bots.length > 0 && h('table', { style: s.table },
+          h('thead', null, h('tr', null,
+            ['Bot', 'Task', 'Model'].map(t => h('th', { key: t, style: s.th }, t)),
+            TOKEN_COLUMNS.map(([k, label]) => h('th', { key: k, style: { ...s.th, textAlign: 'right' } }, label)))),
+          h('tbody', null, bots.flatMap(bot => [
+            ...bot.rows.map((row, i) => h('tr', { key: `${bot.name}:${row.task}:${row.model}:${row.provider}` },
+              h('td', { style: s.td }, i === 0 ? bot.name : ''),
+              h('td', { style: s.td }, taskLabel(row.task)),
+              h('td', { style: { ...s.td, ...s.mono } }, row.model),
+              cells(row))),
+            bot.rows.length > 1 && h('tr', { key: `${bot.name}:total` },
+              h('td', { style: s.td }), h('td', { style: { ...s.td, fontWeight: 600 }, colSpan: 2 }, 'Total'),
+              cells(bot.total, { fontWeight: 600 }))
+          ]))),
+        h('div', { style: { ...s.note, marginTop: 8 } },
+          'A session counts in the period it started. Not recorded by Hermes: curator runs, Honcho’s own model calls, and calls that failed.'))
+    }
+
     function SettingsSummary({ settings, plans }) {
       const pct = v => `${Math.round(Number(v))}%`
       const rows = [
@@ -203,6 +264,8 @@
         h(Held, { cards: status.held || [] }),
         h('div', { style: s.section }, 'Interrupted chats'),
         h(Interrupted, { chats: status.interrupted || [] }),
+        h('div', { style: s.section }, 'Tokens'),
+        h(Tokens),
         h('div', { style: s.section }, 'Settings'),
         h(SettingsSummary, { settings: status.settings, plans: status.plans }))
     }

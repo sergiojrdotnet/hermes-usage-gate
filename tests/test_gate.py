@@ -444,5 +444,39 @@ class InterruptedChatTest(RuntimeTest):
                          [("cto", "First 1:1", "waiting")])
 
 
+class TokenUsageTest(RuntimeTest):
+    def store(self, profile, sessions, usage):
+        import sqlite3
+        home = Path(os.environ["USAGE_GATE_HERMES_ROOT"]) / "profiles" / profile
+        home.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(home / "state.db")
+        db.executescript("create table sessions (id text primary key, title text, started_at real);"
+                         "create table session_model_usage (session_id text, model text, billing_provider text default '',"
+                         " task text default '', api_call_count int, input_tokens int, output_tokens int,"
+                         " cache_read_tokens int, cache_write_tokens int, reasoning_tokens int);")
+        db.executemany("insert into sessions values (?, '', ?)", [(sid, at.timestamp()) for sid, at in sessions])
+        db.executemany("insert into session_model_usage values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", usage)
+        db.commit()
+        db.close()
+
+    def setUp(self):
+        super().setUp()
+        self.store("cto", [("s1", NOW - timedelta(days=1)), ("s2", NOW - timedelta(days=2)), ("old", NOW - timedelta(days=10))], [
+            ("s1", "opus", "claude", "", 10, 100, 50, 1000, 20, 5),
+            ("s2", "opus", "claude", "", 5, 10, 5, 100, 2, 1),
+            ("s1", "haiku", "claude", "title_generation", 1, 500, 20, 0, 900, 0),
+            ("old", "opus", "claude", "", 99, 9999, 9999, 9999, 9999, 9999)])
+        (Path(os.environ["USAGE_GATE_HERMES_ROOT"]) / "profiles" / "ceo" / "state.db").write_text("not a database")
+
+    def test_per_bot_task_and_model_within_the_period(self):
+        rows = runtime.token_usage(7, now=NOW)["rows"]
+        self.assertEqual([(r["bot"], r["task"], r["model"], r["calls"], r["input"], r["cache_read"]) for r in rows],
+                         [("cto", "main", "opus", 15, 110, 1100), ("cto", "title_generation", "haiku", 1, 500, 0)])
+
+    def test_all_time_includes_old_sessions(self):
+        main = runtime.token_usage(None, now=NOW)["rows"][0]
+        self.assertEqual((main["calls"], main["output"]), (114, 10054))
+
+
 if __name__ == "__main__":
     unittest.main()

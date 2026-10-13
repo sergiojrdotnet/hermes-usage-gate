@@ -1,7 +1,7 @@
 manifest_version: 2
 name: hermes-usage-gate
-version: 0.4.0
-description: "Hold back new board cards for a provider's bots while that provider's plan usage is above configurable thresholds, resume the chats a plan limit stopped once it is back, with a read-only Desktop and dashboard page for its status."
+version: 0.5.0
+description: "Hold back new board cards for a provider's bots while that provider's plan usage is above configurable thresholds, resume the chats a plan limit stopped once it is back, and show the tokens each bot used, with a read-only Desktop and dashboard page for its status."
 homepage: "https://github.com/sergiojrdotnet/hermes-usage-gate"
 provides_hooks:
   - on_kanban_dispatch_tick

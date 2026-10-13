@@ -10,7 +10,7 @@ from fastapi import APIRouter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from usage_gate.runtime import refresh, status_view  # noqa: E402
+from usage_gate.runtime import refresh, status_view, token_usage  # noqa: E402
 
 router = APIRouter()
 
@@ -24,3 +24,9 @@ def status() -> dict[str, Any]:
 def check() -> dict[str, Any]:
     refresh(force=True)
     return status_view()
+
+
+@router.get("/tokens/{period}")
+def tokens(period: str) -> dict[str, Any]:
+    """``period`` is a number of days, or ``all``."""
+    return token_usage(None if period == "all" else max(0.01, float(period)))

@@ -2,7 +2,8 @@
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that stops the kanban dispatcher from
 starting new cards for bots whose subscription plan is running out, lets them start again once the plan's
-window resets, and resumes the chats a plan limit cut off.
+window resets, and resumes the chats a plan limit cut off. It also shows how many tokens each bot used, split by
+side task and model.
 
 Every few minutes it reads each provider's account limits (the same windows `hermes usage` shows: Codex
 session/weekly, Claude session/week) and compares them with your thresholds. While a provider is over a
@@ -27,6 +28,16 @@ A chat is left alone when you wrote in it after it stopped, when the bot already
 for a failed turn doesn't count), or when `resume_within_hours` have passed since it first stopped. A resume that
 hits the limit again is retried at the next check, up to 3 times. Board cards, scheduled jobs, webhooks and email
 runs are never resumed this way: the dispatcher and their schedules already run them again.
+
+## Tokens
+
+Hermes records every model call in each profile's session store, with the side task that made it: the bot's own
+work, title generation, compression, vision, web extraction, session search, the background memory review. The
+gate adds them up per bot, task and model (calls, input, cache read and write, output, reasoning). A session counts
+in the period it started, the way `hermes insights` counts it.
+
+Hermes doesn't record the curator's runs, calls that failed, or anything a memory provider such as Honcho spends
+on its own models.
 
 ## Settings
 
@@ -67,7 +78,8 @@ them, and gives each the page and API below (the Desktop sends a plugin page's r
 ```sh
 hermes plugins install https://github.com/sergiojrdotnet/hermes-usage-gate --enable
 hermes usage-gate check    # read usage now and apply
-hermes usage-gate status   # settings, each plan's last reading and decision, held cards
+hermes usage-gate status   # settings, each plan's last reading and decision, held cards, interrupted chats
+hermes usage-gate tokens --days 7   # tokens per bot, side task and model (omit --days for all time)
 ```
 
 ## Page
@@ -75,12 +87,12 @@ hermes usage-gate status   # settings, each plan's last reading and decision, he
 A **Usage Gate** page in the Hermes Desktop (Capabilities → Plugins → Install from Git, Desktop target) and a tab
 in the dashboard show each plan's session and weekly usage against its thresholds, whether the board may start its
 bots' cards, when each window resets, the cards being held, the chats a plan limit stopped this week and
-what became of each, and the settings in force. The page never changes
+what became of each, the tokens each bot used (last 24 h, 7 days, 30 days or all time), and the settings in force. The page never changes
 the settings; edit them in `config.yaml`. **Check now** re-reads usage and applies the result. In the Desktop,
 the status bar names any paused plan.
 
 The page is served by `dashboard/plugin_api.py` at `/api/plugins/hermes-usage-gate/` (`GET /status`,
-`POST /check`). After changing `ui/`, run `python3 build.py`.
+`POST /check`, `GET /tokens/{days|all}`). After changing `ui/`, run `python3 build.py`.
 
 State is kept in `~/.hermes/usage-gate/state.json`, interrupted chats in `interrupted.json` next to it.
 

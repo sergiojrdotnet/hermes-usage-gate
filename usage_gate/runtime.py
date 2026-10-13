@@ -439,6 +439,45 @@ def interrupted_view(settings: Any) -> list[dict]:
     return sorted(rows, key=lambda e: e.get("interrupted_at", ""), reverse=True)
 
 
+TOKEN_COLUMNS = ("calls", "input", "output", "cache_read", "cache_write", "reasoning")
+
+
+def _profile_homes(root: Optional[Path] = None) -> dict[str, Path]:
+    root = root or hermes_root()
+    homes = {"default": root}
+    profiles = root / "profiles"
+    if profiles.is_dir():
+        homes.update({p.name: p for p in sorted(profiles.iterdir()) if p.is_dir() and not p.name.startswith(".")})
+    return homes
+
+
+def token_usage(days: Optional[float] = None, now: Optional[datetime] = None) -> dict:
+    """Tokens per bot, side task and model, from every profile's session store. A session counts when it started
+    in the last ``days`` (all of them when None), the way ``hermes insights`` counts it. ``main`` is the bot's
+    own turns; the other tasks are side tasks (title generation, compression, vision, the background review…)."""
+    import sqlite3
+    cutoff = (now or utcnow()).timestamp() - days * 86400 if days else 0
+    rows = []
+    for profile, home in _profile_homes().items():
+        if not (home / "state.db").exists():
+            continue
+        try:
+            with _session_store(profile) as store:
+                found = store.execute(
+                    "select coalesce(nullif(u.task, ''), 'main'), u.model, u.billing_provider, sum(u.api_call_count),"
+                    " sum(u.input_tokens), sum(u.output_tokens), sum(u.cache_read_tokens), sum(u.cache_write_tokens),"
+                    " sum(u.reasoning_tokens) from session_model_usage u join sessions s on s.id = u.session_id"
+                    " where s.started_at >= ? group by 1, 2, 3", (cutoff,)).fetchall()
+        except sqlite3.Error as exc:
+            log.warning("usage gate: could not read %s's token usage: %s", profile, exc)
+            continue
+        for task, model, provider, *counts in found:
+            rows.append({"bot": profile, "task": task, "model": model, "provider": provider,
+                         **{k: int(v or 0) for k, v in zip(TOKEN_COLUMNS, counts)}})
+    rows.sort(key=lambda r: (r["bot"], r["task"] != "main", r["task"], r["model"]))
+    return {"days": days, "rows": rows}
+
+
 def on_dispatch_tick(profile_name: Optional[str] = None, **_: Any) -> None:
     """Dispatcher hook: refresh in the background, so a slow usage API never delays a tick. Only the default
     profile's dispatcher drives the gate; the plugin is installed in other profiles for its page and API."""

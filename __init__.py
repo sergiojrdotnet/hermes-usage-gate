@@ -7,7 +7,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from usage_gate.runtime import on_api_request_error, on_dispatch_tick, refresh, status_view  # noqa: E402
+from usage_gate.runtime import on_api_request_error, on_dispatch_tick, refresh, status_view, token_usage  # noqa: E402
 
 
 def _setup(parser: Any) -> None:
@@ -15,6 +15,8 @@ def _setup(parser: Any) -> None:
     commands.add_parser("status", help="Settings, each plan's last reading and decision, held cards and "
                                    "interrupted chats")
     commands.add_parser("check", help="Read every provider's usage now and apply the result")
+    tokens = commands.add_parser("tokens", help="Tokens per bot, side task and model")
+    tokens.add_argument("--days", type=float, default=None, help="Only sessions started in the last N days")
     parser.set_defaults(func=_run)
 
 
@@ -25,8 +27,10 @@ def _run(args: Any) -> None:
         result: Any = status_view()
     elif command == "status":
         result = status_view()
+    elif command == "tokens":
+        result = token_usage(getattr(args, "days", None))
     else:
-        result = {"usage": "hermes usage-gate {status,check}"}
+        result = {"usage": "hermes usage-gate {status,check,tokens}"}
     print(json.dumps(result, indent=2, default=str))
 
 
