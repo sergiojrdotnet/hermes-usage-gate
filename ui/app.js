@@ -59,8 +59,8 @@ function createUsageGate(React, api) {
   function Bar({ used, threshold, color }) {
     return h('div', { style: { position: 'relative', height: 8, borderRadius: 4, background: C.track, margin: '4px 0' } },
       h('div', { style: { width: `${Math.min(100, used)}%`, height: '100%', borderRadius: 4, background: color } }),
-      h('div', { title: `Threshold ${threshold}%`, style: { position: 'absolute', top: -3, bottom: -3, left: `${threshold}%`,
-        width: 2, background: C.text, opacity: 0.6 } }))
+      threshold != null && h('div', { title: `Threshold ${threshold}%`, style: { position: 'absolute', top: -3, bottom: -3,
+        left: `${threshold}%`, width: 2, background: C.text, opacity: 0.6 } }))
   }
 
   function pausedName(plan) {
@@ -94,6 +94,38 @@ function createUsageGate(React, api) {
       plan.reason && h('div', { style: { ...s.note, marginTop: 6 } }, plan.reason),
       h('div', { style: s.note }, `Last good reading ${ago(plan.last_reading_at)}`),
       stale && h('div', { style: s.warn }, 'The latest checks could not read this plan; the last decision is being kept.'))
+  }
+
+  function usd(v) {
+    return `$${Number(v || 0).toFixed(2)}`
+  }
+
+  function OpenRouter({ data, label }) {
+    const warned = (data.warnings || []).length > 0
+    const badge = data.error && !data.last_reading_at ? { label: 'Unreadable', color: C.muted }
+      : warned ? { label: 'Warning', color: C.orange } : { label: 'OK', color: C.green }
+    const usedShare = data.total_credits ? Math.min(100, (100 * data.total_usage) / data.total_credits) : 0
+    return h('div', { style: s.card },
+      h('div', { style: { ...s.row, justifyContent: 'space-between' } },
+        h('strong', null, label),
+        h('span', { style: s.badge(badge.color) }, badge.label)),
+      h('div', { style: { ...s.note, margin: '2px 0 10px' } }, 'Watched, never gated: no bot runs on it.'),
+      data.last_reading_at && h('div', { style: { marginBottom: 10 } },
+        h('div', { style: { ...s.row, justifyContent: 'space-between' } },
+          h('span', null, 'Credits'),
+          h('span', { style: { fontVariantNumeric: 'tabular-nums' } }, `${usd(data.total_usage)} of ${usd(data.total_credits)} spent`)),
+        h(Bar, { used: usedShare, threshold: null, color: data.balance < (data.balance_warn_usd ?? -1) ? C.orange : C.accent }),
+        h('div', { style: s.note }, `Balance ${usd(data.balance)}`)),
+      (data.keys || []).map(key => h('div', { key: key.name, style: { marginBottom: 10 } },
+        h('div', { style: { ...s.row, justifyContent: 'space-between' } },
+          h('span', null, `Key ${key.name}`),
+          key.limit != null && h('span', { style: { fontVariantNumeric: 'tabular-nums' } },
+            `${usd(key.spent)} of ${usd(key.limit)}${key.limit_reset ? ` ${key.limit_reset}` : ''}`)),
+        key.limit != null && h(Bar, { used: key.percent || 0, threshold: null, color: C.accent }),
+        h('div', { style: s.note }, `Today ${usd(key.usage_daily)} · week ${usd(key.usage_weekly)} · month ${usd(key.usage_monthly)}`))),
+      (data.warnings || []).map(w => h('div', { key: w, style: s.warn }, w)),
+      data.error && h('div', { style: s.warn }, data.error),
+      h('div', { style: s.note }, `Last good reading ${ago(data.last_reading_at)}`))
   }
 
   function Held({ cards }) {
@@ -221,6 +253,11 @@ function createUsageGate(React, api) {
       ['Comment on held cards', settings.comment_held_cards ? 'Yes' : 'No'],
       ['Resume chats stopped by a plan limit', settings.resume_interrupted_chats ? 'Yes' : 'No']
     ]
+    const openrouter = settings.openrouter || {}
+    if (openrouter.enabled) {
+      rows.push([`${openrouter.label || 'OpenRouter'}: warn when the balance is under`, usd(openrouter.balance_warn_usd)])
+      rows.push([`${openrouter.label || 'OpenRouter'}: warn when a key reaches`, `${Math.round(Number(openrouter.key_warn_percent))}% of its limit`])
+    }
     if (settings.resume_interrupted_chats) {
       rows.push(['Resume within', `${settings.resume_within_hours} h of the first stop`])
       rows.push(['Resume message', settings.resume_message])
@@ -267,7 +304,9 @@ function createUsageGate(React, api) {
       h('div', { style: s.note }, 'New board cards for a plan’s bots wait while its usage is over a threshold. Chats, schedules, webhooks and email runs are never held; a chat a plan limit stopped is resumed once the plan is open again.'),
       error && h('div', { style: s.error }, error),
       h('div', { style: s.section }, 'Plans'),
-      h('div', { style: s.cards }, status.plans.map(plan => h(Plan, { key: plan.provider, plan, refreshMinutes: status.settings.refresh_minutes }))),
+      h('div', { style: s.cards },
+        status.plans.map(plan => h(Plan, { key: plan.provider, plan, refreshMinutes: status.settings.refresh_minutes })),
+        status.openrouter && h(OpenRouter, { data: status.openrouter, label: (status.settings.openrouter || {}).label || 'OpenRouter' })),
       h('div', { style: s.section }, 'Held cards'),
       h(Held, { cards: status.held || [] }),
       h('div', { style: s.section }, 'Interrupted chats'),

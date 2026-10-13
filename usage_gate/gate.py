@@ -20,6 +20,8 @@ DEFAULTS = {
     "resume_message": "The plan limit has reset; continue where you stopped.",
     "resume_within_hours": 12.0,
     "providers": {},
+    "openrouter": {"enabled": True, "key_env": "OPENROUTER_MANAGEMENT_KEY", "workspace_id": "", "label": "OpenRouter",
+                   "balance_warn_usd": 2.0, "key_warn_percent": 80.0},
 }
 
 RESUME = "resume"
@@ -49,6 +51,7 @@ class Settings:
     resume_interrupted_chats: bool = True
     resume_message: str = DEFAULTS["resume_message"]
     resume_within_hours: float = DEFAULTS["resume_within_hours"]
+    openrouter: dict = field(default_factory=lambda: dict(DEFAULTS["openrouter"]))
 
     def thresholds(self, provider: str) -> Thresholds:
         """The provider's own values where set, the defaults for the rest."""
@@ -92,7 +95,19 @@ def settings_from(raw: Optional[dict]) -> Settings:
                                                      DEFAULTS["resume_interrupted_chats"]) is not False,
                     resume_message=str(raw.get("resume_message") or DEFAULTS["resume_message"]).strip(),
                     resume_within_hours=max(0.5, _number(raw.get("resume_within_hours"),
-                                                         DEFAULTS["resume_within_hours"])))
+                                                         DEFAULTS["resume_within_hours"])),
+                    openrouter=_openrouter_settings(raw.get("openrouter")))
+
+
+def _openrouter_settings(raw: Any) -> dict:
+    raw = raw if isinstance(raw, dict) else {}
+    base = DEFAULTS["openrouter"]
+    return {"enabled": raw.get("enabled", base["enabled"]) is not False,
+            "key_env": str(raw.get("key_env") or base["key_env"]),
+            "workspace_id": str(raw.get("workspace_id") or ""),
+            "label": str(raw.get("label") or base["label"]),
+            "balance_warn_usd": max(0.0, _number(raw.get("balance_warn_usd"), base["balance_warn_usd"])),
+            "key_warn_percent": max(1.0, _number(raw.get("key_warn_percent"), base["key_warn_percent"]))}
 
 
 MODEL_FAMILIES = ("fable", "mythos", "opus", "sonnet", "haiku", "astra", "sol", "luna", "terra")
@@ -277,3 +292,33 @@ def resume_action(entry: dict, provider_state: Optional[dict], now: datetime, wi
     if (provider_state or {}).get("decision") != OPEN or holds(provider_state, entry.get("model")):
         return WAIT
     return RESUME
+
+
+def openrouter_state(credits: Optional[dict], keys: Optional[list], settings: dict, now: datetime,
+                     error: Optional[str] = None, previous: Optional[dict] = None) -> dict:
+    """OpenRouter's balance and each key's spend, with the warnings to show. OpenRouter is watched, never gated:
+    no bot runs on it. When it can't be read, the last numbers stay and the error is shown next to them."""
+    at = now.isoformat()
+    if error:
+        return {**(previous or {}), "checked_at": at, "error": error}
+    total, used = _number((credits or {}).get("total_credits"), 0.0), _number((credits or {}).get("total_usage"), 0.0)
+    balance = total - used
+    warnings = []
+    if balance < settings["balance_warn_usd"]:
+        warnings.append(f"Balance ${balance:.2f} is under ${settings['balance_warn_usd']:.2f}")
+    rows = []
+    for key in keys or []:
+        if not isinstance(key, dict) or key.get("disabled"):
+            continue
+        limit, remaining = key.get("limit"), key.get("limit_remaining")
+        spent = _number(limit, 0.0) - _number(remaining, 0.0) if limit is not None and remaining is not None else None
+        percent = 100.0 * spent / _number(limit, 0.0) if spent is not None and _number(limit, 0.0) > 0 else None
+        name = str(key.get("name") or key.get("label") or "key")
+        rows.append({"name": name, "limit": limit, "limit_reset": key.get("limit_reset"), "spent": spent,
+                     "percent": percent, **{k: _number(key.get(k), 0.0)
+                                            for k in ("usage_daily", "usage_weekly", "usage_monthly", "usage")}})
+        if percent is not None and percent >= settings["key_warn_percent"]:
+            period = f" {key['limit_reset']}" if key.get("limit_reset") else ""
+            warnings.append(f"Key {name} at {percent:.0f}% of its ${_number(limit, 0.0):.2f}{period} limit")
+    return {"checked_at": at, "last_reading_at": at, "balance": balance, "total_credits": total, "total_usage": used,
+            "balance_warn_usd": settings["balance_warn_usd"], "keys": rows, "warnings": warnings, "error": None}

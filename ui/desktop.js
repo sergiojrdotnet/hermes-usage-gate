@@ -11,8 +11,10 @@ function PausedPlans({ ctx }) {
   React.useEffect(() => {
     let alive = true
     const load = () => ctx.rest('/status')
-      .then(r => alive && setPaused(r.plans.filter(p => p.decision === 'paused' || (p.paused_models || []).length)
-        .map(p => p.decision === 'paused' ? p.label : `${p.label} (${p.paused_models.join(', ')})`)))
+      .then(r => alive && setPaused([
+        ...r.plans.filter(p => p.decision === 'paused' || (p.paused_models || []).length)
+          .map(p => `⏸ ${p.decision === 'paused' ? p.label : `${p.label} (${p.paused_models.join(', ')})`} paused`),
+        ...((r.openrouter && (r.openrouter.warnings || []).length) ? [`⚠ ${(r.settings.openrouter || {}).label || 'OpenRouter'} low`] : [])]))
       .catch(() => {})
     load()
     const timer = setInterval(load, 60000)
@@ -20,10 +22,10 @@ function PausedPlans({ ctx }) {
   }, [])
   if (!paused.length) return null
   return React.createElement('button', {
-    type: 'button', onClick: () => host.navigate(ROUTE), title: 'New board cards for these plans’ bots are waiting',
+    type: 'button', onClick: () => host.navigate(ROUTE), title: 'Open the Usage Gate page',
     style: { display: 'inline-flex', alignItems: 'center', height: '100%', padding: '0 6px', fontSize: 11, border: 'none',
       background: 'none', cursor: 'pointer', color: 'var(--ui-red, #d64545)' }
-  }, `⏸ ${paused.join(', ')} paused`)
+  }, paused.join(' · '))
 }
 
 export default {

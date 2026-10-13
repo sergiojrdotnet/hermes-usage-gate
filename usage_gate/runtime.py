@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from usage_gate.gate import (RESUME, WAIT, Reading, allowlist, decide, held_comment, held_episode, held_windows,
-                             holds, is_limit_error, reading_from_snapshot, resume_action, settings_from, utcnow)
+                             holds, is_limit_error, openrouter_state, reading_from_snapshot, resume_action, settings_from,
+                             utcnow)
 
 log = logging.getLogger("hermes_usage_gate")
 CHAT_PLATFORMS = ("desktop", "tui", "cli")
@@ -86,6 +87,28 @@ def fetch(provider: str, models: list[str]) -> Reading:
     except Exception as exc:
         return Reading(provider, now, error=f"fetch failed: {exc}")
     return reading_from_snapshot(provider, snapshot, now, models)
+
+
+def _openrouter_get(path: str, key: str) -> Any:
+    import urllib.request
+    request = urllib.request.Request("https://openrouter.ai/api/v1" + path, headers={"Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.load(response).get("data")
+
+
+def refresh_openrouter(settings: Any, previous: Optional[dict]) -> Optional[dict]:
+    """OpenRouter's state, or None when it isn't configured (no management key in the environment)."""
+    config = settings.openrouter
+    key = os.environ.get(config["key_env"], "").strip()
+    if not config["enabled"] or not key:
+        return None
+    workspace = config["workspace_id"]
+    try:
+        credits = _openrouter_get("/credits", key)
+        keys = _openrouter_get("/keys" + (f"?workspace_id={workspace}" if workspace else ""), key)
+    except Exception as exc:
+        return openrouter_state(None, None, config, utcnow(), error=f"could not read OpenRouter: {exc}", previous=previous)
+    return openrouter_state(credits, keys, config, utcnow())
 
 
 def _run_hermes(*args: str) -> subprocess.CompletedProcess:
@@ -388,8 +411,9 @@ def refresh(force: bool = False) -> dict:
             notes = comment_held_cards(settings, profiles, providers, notes)
         if settings.enabled and settings.resume_interrupted_chats:
             resume_interrupted_chats(settings, providers)
+        openrouter = refresh_openrouter(settings, state.get("openrouter")) if settings.enabled else None
         state = {"checked_at": now.isoformat(), "enabled": settings.enabled, "settings": settings_view(settings),
-                 "providers": providers, "applied": applied, "held_notes": notes}
+                 "providers": providers, "applied": applied, "held_notes": notes, "openrouter": openrouter}
         save_state(state)
         return state
 
@@ -400,6 +424,7 @@ def settings_view(settings: Any) -> dict:
             "hold_minutes": settings.hold_minutes, "comment_held_cards": settings.comment_held_cards,
             "resume_interrupted_chats": settings.resume_interrupted_chats, "resume_message": settings.resume_message,
             "resume_within_hours": settings.resume_within_hours,
+            "openrouter": {k: v for k, v in settings.openrouter.items() if k != "key_env"},
             "providers": {p: {**settings.per_provider.get(p, {}),
                               **({"label": settings.labels[p]} if p in settings.labels else {})}
                           for p in sorted(set(settings.per_provider) | set(settings.labels))}}
@@ -426,6 +451,7 @@ def status_view() -> dict:
     tz = _timezone()
     return {"settings": settings_view(settings), "checked_at": state.get("checked_at"), "plans": plans,
             "allowlist": state.get("applied"), "held": held, "interrupted": interrupted_view(settings),
+            "openrouter": state.get("openrouter"),
             "timezone": getattr(tz, "key", None)}
 
 

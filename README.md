@@ -42,6 +42,15 @@ provider already holds is billed as a cache read. Reasoning tokens are part of o
 Hermes doesn't record the curator's runs, calls that failed, or anything a memory provider such as Honcho spends
 on its own models.
 
+## OpenRouter
+
+When the environment holds an OpenRouter management key (`OPENROUTER_MANAGEMENT_KEY` by default), each check also reads
+the account's credits and every key's spend, and the page shows them next to the plans: credits spent of those bought,
+the balance, and each key's spend today, this week and this month against its limit. OpenRouter is watched, never gated,
+since no bot runs on it (a memory service such as Honcho may). The page and the Desktop status bar warn when the balance
+drops under `balance_warn_usd` or a key reaches `key_warn_percent` of its limit. When OpenRouter can't be read, the
+last numbers stay and the error is shown next to them.
+
 ## Settings
 
 In the default profile's `config.yaml`; every key is optional:
@@ -57,6 +66,12 @@ usage_gate:
   resume_interrupted_chats: true
   resume_message: "The plan limit has reset; continue where you stopped."
   resume_within_hours: 12 # give up on a chat this long after it first stopped
+  openrouter:             # optional; read only when the key below is in the environment
+    key_env: OPENROUTER_MANAGEMENT_KEY
+    workspace_id: ""      # list only this workspace's keys
+    label: OpenRouter
+    balance_warn_usd: 2
+    key_warn_percent: 80
   providers:              # optional per-provider overrides
     openai-codex:
       label: ChatGPT Plus # the plan's name in held-card comments (default: the provider id)

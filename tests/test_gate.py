@@ -557,5 +557,52 @@ class FableWeekTest(unittest.TestCase):
         self.assertIn("Claude Max fable week at 85%", comments[0][1])
 
 
+class OpenRouterTest(unittest.TestCase):
+    SETTINGS = gate.settings_from({"openrouter": {"workspace_id": "ws1", "label": "OpenRouter"}}).openrouter
+    KEY = {"name": "Hermes", "limit": 20, "limit_reset": "monthly", "limit_remaining": 19.84, "usage": 0.16,
+           "usage_daily": 0.05, "usage_weekly": 0.16, "usage_monthly": 0.16}
+
+    def test_healthy_numbers_have_no_warning(self):
+        state = gate.openrouter_state({"total_credits": 10, "total_usage": 0.16}, [self.KEY], self.SETTINGS, NOW)
+        self.assertAlmostEqual(state["balance"], 9.84)
+        self.assertEqual(state["warnings"], [])
+        self.assertAlmostEqual(state["keys"][0]["spent"], 0.16)
+
+    def test_low_balance_and_a_key_near_its_limit_warn(self):
+        key = {**self.KEY, "limit_remaining": 3.0}
+        state = gate.openrouter_state({"total_credits": 10, "total_usage": 8.5}, [key], self.SETTINGS, NOW)
+        self.assertEqual(state["warnings"], ["Balance $1.50 is under $2.00", "Key Hermes at 85% of its $20.00 monthly limit"])
+
+    def test_disabled_keys_are_left_out(self):
+        state = gate.openrouter_state({"total_credits": 10, "total_usage": 0}, [{**self.KEY, "disabled": True}], self.SETTINGS, NOW)
+        self.assertEqual(state["keys"], [])
+
+    def test_an_unreadable_api_keeps_the_last_numbers(self):
+        good = gate.openrouter_state({"total_credits": 10, "total_usage": 0.16}, [self.KEY], self.SETTINGS, NOW)
+        bad = gate.openrouter_state(None, None, self.SETTINGS, NOW + timedelta(minutes=10), error="HTTP 503", previous=good)
+        self.assertEqual((bad["balance"], bad["error"], bad["last_reading_at"]), (good["balance"], "HTTP 503", NOW.isoformat()))
+
+    def test_settings_defaults_and_bounds(self):
+        o = gate.settings_from({"openrouter": {"balance_warn_usd": -5, "key_warn_percent": 0}}).openrouter
+        self.assertEqual((o["enabled"], o["key_env"], o["balance_warn_usd"], o["key_warn_percent"]),
+                         (True, "OPENROUTER_MANAGEMENT_KEY", 0.0, 1.0))
+
+    def test_refresh_reads_credits_and_the_workspace_keys(self):
+        settings = gate.settings_from({"openrouter": {"workspace_id": "ws1"}})
+        calls = []
+
+        def get(path, key):
+            calls.append((path, key))
+            return {"total_credits": 10, "total_usage": 1} if path == "/credits" else [self.KEY]
+
+        with mock.patch.dict(os.environ, {"OPENROUTER_MANAGEMENT_KEY": "sk-test"}), \
+             mock.patch.object(runtime, "_openrouter_get", side_effect=get):
+            state = runtime.refresh_openrouter(settings, None)
+        self.assertEqual(calls, [("/credits", "sk-test"), ("/keys?workspace_id=ws1", "sk-test")])
+        self.assertEqual(state["balance"], 9.0)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(runtime.refresh_openrouter(settings, None))
+
+
 if __name__ == "__main__":
     unittest.main()
