@@ -88,7 +88,8 @@ class DecideTest(unittest.TestCase):
 
 
 class AllowlistTest(unittest.TestCase):
-    profiles = {"default": "codex", "ceo": "codex", "cto": "claude", "web": "claude"}
+    profiles = {"default": ("codex", "gpt-6.1-sol"), "ceo": ("codex", "gpt-6-astra"), "cto": ("claude", "fable"),
+                "web": ("claude", "opus")}
 
     def test_none_when_nothing_paused(self):
         self.assertIsNone(gate.allowlist(self.profiles, {"codex": {"decision": OPEN}, "claude": {"decision": OPEN}}))
@@ -481,6 +482,79 @@ class TokenUsageTest(RuntimeTest):
     def test_all_time_includes_old_sessions(self):
         main = runtime.token_usage(None, now=NOW)["rows"][0]
         self.assertEqual((main["calls"], main["output"]), (114, 10054))
+
+
+class FableWeekTest(unittest.TestCase):
+    """Max carries a weekly cap on Fable alone next to the account's own windows."""
+
+    def snap(self, fable_week, session=10, week=10):
+        return snapshot(("Current session", session, "account"), ("Current week", week, "account"),
+                        ("Fable week", fable_week, "account"))
+
+    def test_family_names(self):
+        self.assertEqual([gate.model_family(t) for t in ("fable", "claude-fable-5-1", "Fable week", "gpt-6.1-sol",
+                                                         "Current week (Opus)", "Console week", "Current session")],
+                         ["fable", "fable", "fable", "sol", "opus", None, None])
+
+    def test_fable_week_counts_only_when_a_bot_runs_fable(self):
+        without = gate.reading_from_snapshot("claude", self.snap(95), NOW, models=["opus"])
+        self.assertEqual([w["label"] for w in without.windows], ["Current session", "Current week"])
+        with_fable = gate.reading_from_snapshot("claude", self.snap(95), NOW, models=["opus", "fable"])
+        self.assertEqual([(w["label"], w["model"]) for w in with_fable.windows],
+                         [("Current session", None), ("Current week", None), ("Fable week", "fable")])
+
+    def test_full_fable_week_pauses_only_fable(self):
+        state = gate.decide(gate.reading_from_snapshot("claude", self.snap(85), NOW, models=["opus", "fable"]), T, None,
+                            timedelta(minutes=30))
+        self.assertEqual((state["decision"], state["paused_models"]), (OPEN, ["fable"]))
+        self.assertIn("only fable paused", state["reason"])
+        profiles = {"cto": ("claude", "fable"), "backend": ("claude", "opus"), "qa": ("codex", "gpt-6.1-sol")}
+        self.assertEqual(gate.allowlist(profiles, {"claude": state, "codex": {"decision": OPEN}}), ["backend", "qa"])
+        self.assertEqual([w["label"] for w in gate.held_windows(state, "fable")], ["Fable week"])
+        self.assertEqual(gate.held_windows(state, "opus"), [])
+
+    def test_a_full_account_window_still_pauses_everyone(self):
+        state = gate.decide(gate.reading_from_snapshot("claude", self.snap(85, session=90), NOW, models=["opus", "fable"]),
+                            T, None, timedelta(minutes=30))
+        self.assertEqual((state["decision"], state["paused_models"]), (PAUSED, ["fable"]))
+        self.assertEqual(gate.allowlist({"cto": ("claude", "fable"), "backend": ("claude", "opus")}, {"claude": state}), [])
+        self.assertEqual([w["label"] for w in gate.held_windows(state, "opus")], ["Current session"])
+
+    def test_model_pause_episode_is_stable_and_kept_when_unreadable(self):
+        first = gate.decide(gate.reading_from_snapshot("claude", self.snap(85), NOW, models=["fable"]), T, None,
+                            timedelta(minutes=30))
+        later = gate.decide(gate.reading_from_snapshot("claude", self.snap(90), NOW + timedelta(minutes=10), models=["fable"]),
+                            T, first, timedelta(minutes=30))
+        self.assertEqual(gate.held_episode(later, "fable"), gate.held_episode(first, "fable"))
+        kept = gate.decide(Reading("claude", NOW + timedelta(minutes=20), error="HTTP 429"), T, later, timedelta(minutes=30))
+        self.assertEqual(kept["paused_models"], ["fable"])
+        expired = gate.decide(Reading("claude", NOW + timedelta(hours=2), error="HTTP 429"), T, later, timedelta(minutes=30))
+        self.assertNotIn("paused_models", expired)
+
+    def test_an_interrupted_fable_chat_waits_while_fable_is_paused(self):
+        state = {"decision": OPEN, "paused_models": ["fable"]}
+        entry = {"interrupted_at": NOW.isoformat(), "resumes": 0}
+        wait = gate.resume_action({**entry, "model": "fable"}, state, NOW, timedelta(hours=12), False, False)
+        go = gate.resume_action({**entry, "model": "opus"}, state, NOW, timedelta(hours=12), False, False)
+        self.assertEqual((wait, go), (gate.WAIT, gate.RESUME))
+
+    def test_held_cards_of_fable_bots_only(self):
+        state = gate.decide(gate.reading_from_snapshot("claude", self.snap(85), NOW, models=["opus", "fable"]), T, None,
+                            timedelta(minutes=30))
+        cards = {"ready": [{"id": "t_1", "assignee": "cto"}, {"id": "t_2", "assignee": "backend"}], "review": []}
+        comments = []
+
+        def kanban(*args):
+            if args[0] == "list":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(cards[args[2]]), stderr="")
+            comments.append((args[1], args[-1]))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(runtime, "_kanban", side_effect=kanban), mock.patch.object(runtime, "_timezone", return_value=None):
+            runtime.comment_held_cards(gate.settings_from({"providers": {"claude": {"label": "Claude Max"}}}),
+                                       {"cto": ("claude", "fable"), "backend": ("claude", "opus")}, {"claude": state}, {})
+        self.assertEqual([c for c, _ in comments], ["t_1"])
+        self.assertIn("Claude Max fable week at 85%", comments[0][1])
 
 
 if __name__ == "__main__":

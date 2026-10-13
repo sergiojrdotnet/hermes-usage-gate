@@ -65,7 +65,10 @@ usage_gate:
 
 Reset times in comments use the config's `timezone` when it is set, UTC otherwise.
 
-A window that limits only one model family counts only when one of that provider's bots runs that model. When a
+A window that limits only one model family (Claude Max's "Fable week", say) counts only when one of that provider's
+bots runs that model, and when it crosses its threshold it holds only the bots on that family: the plan's other bots keep
+starting their cards. A window that limits the whole account holds every bot on the plan. A chat stopped by a model's
+own limit is resumed once that limit is back, not just the account's. When a
 provider's usage can't be read (for example the usage API rate-limits the request), its last decision holds for
 `hold_minutes` after the last good reading; after that it opens, so a broken usage API never stops the board for
 good.

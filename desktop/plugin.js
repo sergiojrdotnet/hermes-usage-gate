@@ -70,8 +70,14 @@ function createUsageGate(React, api) {
         width: 2, background: C.text, opacity: 0.6 } }))
   }
 
+  function pausedName(plan) {
+    return plan.decision === 'paused' ? plan.label : `${plan.label} (${(plan.paused_models || []).join(', ')})`
+  }
+
   function Plan({ plan, refreshMinutes }) {
-    const decision = DECISIONS[plan.decision] || { label: 'No reading yet', color: C.muted }
+    const partial = plan.decision !== 'paused' && (plan.paused_models || []).length > 0
+    const decision = partial ? { label: `${plan.paused_models.join(', ')} paused`, color: C.orange }
+      : DECISIONS[plan.decision] || { label: 'No reading yet', color: C.muted }
     const stale = plan.last_reading_at && Date.now() - new Date(plan.last_reading_at).getTime() > refreshMinutes * 2 * 60000
     const windows = plan.windows || []
     return h('div', { style: s.card },
@@ -79,6 +85,8 @@ function createUsageGate(React, api) {
         h('strong', null, plan.label),
         h('span', { style: s.badge(decision.color) }, decision.label)),
       h('div', { style: { ...s.note, margin: '2px 0 10px' } }, plan.bots.length ? plan.bots.join(', ') : 'No bots on this plan'),
+      partial && h('div', { style: { ...s.warn, marginBottom: 10 } },
+        `Held: ${(plan.held_bots || []).join(', ') || 'no bot'}. The plan's other bots still start their cards.`),
       windows.length ? windows.map(w => {
         const threshold = w.kind === 'session' ? plan.thresholds.session_percent : plan.thresholds.week_percent
         const over = w.used_percent >= threshold
@@ -254,12 +262,13 @@ function createUsageGate(React, api) {
       api.post('/check').then(setStatus).catch(err => setError(errorText(err))).finally(() => setChecking(false))
     }
     if (!status) return h('div', { style: s.page }, error ? h('div', { style: s.error }, error) : h('div', { style: s.note }, 'Loading…'))
-    const paused = status.plans.filter(p => p.decision === 'paused')
+    const paused = status.plans.filter(p => p.decision === 'paused' || (p.paused_models || []).length)
     return h('div', { style: s.page },
       h('div', { style: s.header },
         h('h1', { style: s.title }, 'Usage Gate'),
-        h('span', { style: s.badge(!status.settings.enabled ? C.muted : paused.length ? C.red : C.green) },
-          !status.settings.enabled ? 'Disabled' : paused.length ? `${paused.length} plan${paused.length > 1 ? 's' : ''} paused` : 'All plans open'),
+        h('span', { style: s.badge(!status.settings.enabled ? C.muted : paused.some(p => p.decision === 'paused') ? C.red
+          : paused.length ? C.orange : C.green) },
+          !status.settings.enabled ? 'Disabled' : paused.length ? `Paused: ${paused.map(pausedName).join(', ')}` : 'All plans open'),
         h('span', { style: s.note }, `Checked ${ago(status.checked_at)} · every ${status.settings.refresh_minutes} min`),
         h('button', { type: 'button', onClick: check, disabled: checking, style: s.button() }, checking ? 'Checking…' : 'Check now')),
       h('div', { style: s.note }, 'New board cards for a plan’s bots wait while its usage is over a threshold. Chats, schedules, webhooks and email runs are never held; a chat a plan limit stopped is resumed once the plan is open again.'),
@@ -282,7 +291,8 @@ function PausedPlans({ ctx }) {
   React.useEffect(() => {
     let alive = true
     const load = () => ctx.rest('/status')
-      .then(r => alive && setPaused(r.plans.filter(p => p.decision === 'paused').map(p => p.label)))
+      .then(r => alive && setPaused(r.plans.filter(p => p.decision === 'paused' || (p.paused_models || []).length)
+        .map(p => p.decision === 'paused' ? p.label : `${p.label} (${p.paused_models.join(', ')})`)))
       .catch(() => {})
     load()
     const timer = setInterval(load, 60000)

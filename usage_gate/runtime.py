@@ -12,8 +12,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
-from usage_gate.gate import (PAUSED, RESUME, WAIT, Reading, allowlist, decide, held_comment, is_limit_error,
-                             reading_from_snapshot, resume_action, settings_from, utcnow)
+from usage_gate.gate import (RESUME, WAIT, Reading, allowlist, decide, held_comment, held_episode, held_windows,
+                             holds, is_limit_error, reading_from_snapshot, resume_action, settings_from, utcnow)
 
 log = logging.getLogger("hermes_usage_gate")
 CHAT_PLATFORMS = ("desktop", "tui", "cli")
@@ -133,18 +133,18 @@ def comment_held_cards(settings: Any, profiles: dict[str, tuple[str, str]], prov
                        notes: dict[str, str]) -> dict[str, str]:
     """Leave one comment per held card per pause, so the board shows why it isn't starting.
     Returns ``{card id: pause it was told about}`` for the cards still held."""
-    paused = {p: s for p, s in providers.items() if s.get("decision") == PAUSED}
-    if not paused:
+    held = {name: (provider, model) for name, (provider, model) in profiles.items()
+            if holds(providers.get(provider), model)}
+    if not held:
         return {}
-    by_profile = {name: provider for name, (provider, _) in profiles.items() if provider in paused}
     tz = _timezone()
     kept = {}
-    for card in held_cards(set(by_profile)):
+    for card in held_cards(set(held)):
         card_id = str(card.get("id"))
-        provider = by_profile[card["assignee"]]
-        episode = paused[provider].get("paused_since") or ""
+        provider, model = held[card["assignee"]]
+        episode = held_episode(providers[provider], model)
         if notes.get(card_id) != episode:
-            text = held_comment(settings.label(provider), paused[provider].get("over") or [], tz)
+            text = held_comment(settings.label(provider), held_windows(providers[provider], model), tz)
             result = _kanban("comment", card_id, "--author", "usage-gate", text)
             if result.returncode != 0:
                 log.warning("usage gate: could not comment on %s: %s", card_id, result.stderr.strip()[-200:])
@@ -215,7 +215,7 @@ def _current_profile() -> str:
 
 
 def record_interruption(profile: str, session_id: str, provider: str, platform: str, error: str,
-                        at: Optional[datetime] = None) -> None:
+                        at: Optional[datetime] = None, model: str = "") -> None:
     """Note a chat whose model call failed on its plan's limit, so it is resumed once the limit is back. A failure
     in a chat still waiting, or shortly after the gate resumed it, continues the same interruption: its expiry
     still counts from the first failure and its resumes keep adding up."""
@@ -227,7 +227,7 @@ def record_interruption(profile: str, session_id: str, provider: str, platform: 
         resolved = previous.get("resolved_at")
         chained = previous.get("status") == "waiting" or (
             previous.get("status") == "resumed" and resolved and at - datetime.fromisoformat(resolved) < RESUME_CHAIN)
-        entries[key] = {"profile": profile, "session_id": session_id, "provider": provider,
+        entries[key] = {"profile": profile, "session_id": session_id, "provider": provider, "model": model,
                         "platform": previous.get("platform", platform) if chained else platform,
                         "first_interrupted_at": previous.get("first_interrupted_at", at.isoformat()) if chained
                         else at.isoformat(),
@@ -236,8 +236,8 @@ def record_interruption(profile: str, session_id: str, provider: str, platform: 
         _save_interruptions(entries)
 
 
-def on_api_request_error(session_id: str = "", platform: str = "", provider: str = "", status_code: Any = None,
-                         reason: Any = None, error: Any = None, **_: Any) -> None:
+def on_api_request_error(session_id: str = "", platform: str = "", provider: str = "", model: str = "",
+                         status_code: Any = None, reason: Any = None, error: Any = None, **_: Any) -> None:
     """Hook for every failed model call: keep the chats that stopped on a plan limit. Board cards, schedules,
     webhooks and email runs are left out; the dispatcher and their schedules already take care of them."""
     try:
@@ -246,7 +246,7 @@ def on_api_request_error(session_id: str = "", platform: str = "", provider: str
         if not is_limit_error(status_code, reason, error):
             return
         message = error.get("message", "") if isinstance(error, dict) else str(error or "")
-        record_interruption(_profile_of(session_id), session_id, provider, platform, message)
+        record_interruption(_profile_of(session_id), session_id, provider, platform, message, model=str(model or ""))
     except Exception:
         log.exception("usage gate: could not record an interrupted chat")
 
@@ -379,7 +379,7 @@ def refresh(force: bool = False) -> dict:
                 if (previous or {}).get("decision") != providers[provider]["decision"]:
                     log.warning("usage gate: %s is now %s (%s)", provider, providers[provider]["decision"],
                                 providers[provider]["reason"])
-            wanted = allowlist({name: p for name, (p, _) in profiles.items()}, providers)
+            wanted = allowlist(profiles, providers)
         else:
             wanted = None
         applied = apply_allowlist(wanted, applied)
@@ -418,8 +418,10 @@ def status_view() -> dict:
         plans.append({"provider": provider, "label": settings.label(provider),
                       "thresholds": vars(settings.thresholds(provider)),
                       "bots": sorted(n for n, (p, _) in profiles.items() if p == provider and n != "default"),
+                      "held_bots": sorted(n for n, (p, m) in profiles.items()
+                                          if p == provider and n != "default" and holds(current, m)),
                       **current})
-    paused = {n for n, (p, _) in profiles.items() if (providers.get(p) or {}).get("decision") == PAUSED}
+    paused = {n for n, (p, m) in profiles.items() if holds(providers.get(p), m)}
     held = [{k: c.get(k) for k in ("id", "title", "assignee", "status")} for c in held_cards(paused)] if paused else []
     tz = _timezone()
     return {"settings": settings_view(settings), "checked_at": state.get("checked_at"), "plans": plans,

@@ -11,7 +11,8 @@ function PausedPlans({ ctx }) {
   React.useEffect(() => {
     let alive = true
     const load = () => ctx.rest('/status')
-      .then(r => alive && setPaused(r.plans.filter(p => p.decision === 'paused').map(p => p.label)))
+      .then(r => alive && setPaused(r.plans.filter(p => p.decision === 'paused' || (p.paused_models || []).length)
+        .map(p => p.decision === 'paused' ? p.label : `${p.label} (${p.paused_models.join(', ')})`)))
       .catch(() => {})
     load()
     const timer = setInterval(load, 60000)
