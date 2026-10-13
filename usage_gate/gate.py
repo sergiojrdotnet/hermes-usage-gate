@@ -1,6 +1,7 @@
 """Decide which bots the board may start, from each provider's plan usage."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
@@ -15,8 +16,19 @@ DEFAULTS = {
     "refresh_minutes": 5.0,
     "hold_minutes": 30.0,
     "comment_held_cards": True,
+    "resume_interrupted_chats": True,
+    "resume_message": "The plan limit has reset; continue where you stopped.",
+    "resume_within_hours": 12.0,
     "providers": {},
 }
+
+RESUME = "resume"
+WAIT = "wait"
+EXPIRED = "expired"
+SKIPPED_USER = "skipped-user"
+SKIPPED_RECOVERED = "skipped-recovered"
+GAVE_UP = "gave-up"
+MAX_RESUMES = 3
 
 
 @dataclass(frozen=True)
@@ -34,6 +46,9 @@ class Settings:
     per_provider: dict[str, dict] = field(default_factory=dict)
     comment_held_cards: bool = True
     labels: dict[str, str] = field(default_factory=dict)
+    resume_interrupted_chats: bool = True
+    resume_message: str = DEFAULTS["resume_message"]
+    resume_within_hours: float = DEFAULTS["resume_within_hours"]
 
     def thresholds(self, provider: str) -> Thresholds:
         """The provider's own values where set, the defaults for the rest."""
@@ -72,7 +87,12 @@ def settings_from(raw: Optional[dict]) -> Settings:
                     hold_minutes=max(0.0, _number(raw.get("hold_minutes"), DEFAULTS["hold_minutes"])),
                     default=default, per_provider=per_provider,
                     comment_held_cards=raw.get("comment_held_cards", DEFAULTS["comment_held_cards"]) is not False,
-                    labels=labels)
+                    labels=labels,
+                    resume_interrupted_chats=raw.get("resume_interrupted_chats",
+                                                     DEFAULTS["resume_interrupted_chats"]) is not False,
+                    resume_message=str(raw.get("resume_message") or DEFAULTS["resume_message"]).strip(),
+                    resume_within_hours=max(0.5, _number(raw.get("resume_within_hours"),
+                                                         DEFAULTS["resume_within_hours"])))
 
 
 def window_kind(label: str) -> Optional[str]:
@@ -188,3 +208,31 @@ def allowlist(profile_providers: dict[str, str], states: dict[str, dict]) -> Opt
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def is_limit_error(status_code: Any, reason: Any, error: Any) -> bool:
+    """Whether a failed model call hit the plan's usage limit (as opposed to any other failure)."""
+    if status_code == 429:
+        return True
+    text = " ".join(str(part) for part in (reason or "", (error or {}).get("type", "") if isinstance(error, dict) else error,
+                                           (error or {}).get("message", "") if isinstance(error, dict) else ""))
+    return bool(re.search(r"\b429\b|rate[\s_-]?limit|usage[\s_-]?limit|quota", text, re.IGNORECASE))
+
+
+def resume_action(entry: dict, provider_state: Optional[dict], now: datetime, within: timedelta,
+                  user_after: bool, answered_after: bool) -> str:
+    """What to do with one interrupted chat: resume it, keep waiting, or drop it (expired, given up after
+    ``MAX_RESUMES`` resumes that hit the limit again, or you or the bot already moved on). Only resumed when its
+    provider's latest decision is open."""
+    first = datetime.fromisoformat(entry.get("first_interrupted_at") or entry["interrupted_at"])
+    if now - first > within:
+        return EXPIRED
+    if user_after:
+        return SKIPPED_USER
+    if answered_after:
+        return SKIPPED_RECOVERED
+    if entry.get("resumes", 0) >= MAX_RESUMES:
+        return GAVE_UP
+    if (provider_state or {}).get("decision") != OPEN:
+        return WAIT
+    return RESUME

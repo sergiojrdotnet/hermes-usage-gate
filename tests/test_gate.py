@@ -291,5 +291,158 @@ class HookGuardTest(unittest.TestCase):
         runtime._running.clear()
 
 
+class LimitErrorTest(unittest.TestCase):
+    def test_plan_limits_count(self):
+        self.assertTrue(gate.is_limit_error(429, None, None))
+        self.assertTrue(gate.is_limit_error(None, "rate_limit", {"type": "ClaudeAPIError", "message": "x"}))
+        self.assertTrue(gate.is_limit_error(None, None, {"type": "E", "message": "You've hit your usage limit"}))
+
+    def test_other_failures_do_not(self):
+        self.assertFalse(gate.is_limit_error(500, "server_error", {"type": "APIError", "message": "Internal error"}))
+        self.assertFalse(gate.is_limit_error(None, "timeout", "read timed out"))
+
+
+class ResumeActionTest(unittest.TestCase):
+    ENTRY = {"interrupted_at": (NOW - timedelta(hours=2)).isoformat(), "resumes": 0}
+    WITHIN = timedelta(hours=12)
+
+    def action(self, entry=None, decision=OPEN, user=False, answered=False, now=NOW):
+        return gate.resume_action(entry or self.ENTRY, {"decision": decision}, now, self.WITHIN, user, answered)
+
+    def test_resumes_once_the_plan_is_open(self):
+        self.assertEqual(self.action(), gate.RESUME)
+
+    def test_waits_while_the_plan_is_paused_or_unread(self):
+        self.assertEqual(self.action(decision=PAUSED), gate.WAIT)
+        self.assertEqual(gate.resume_action(self.ENTRY, None, NOW, self.WITHIN, False, False), gate.WAIT)
+
+    def test_expiry_counts_from_the_first_stop(self):
+        entry = {**self.ENTRY, "first_interrupted_at": (NOW - timedelta(hours=13)).isoformat()}
+        self.assertEqual(self.action(entry), gate.EXPIRED)
+
+    def test_you_or_the_bot_moved_on(self):
+        self.assertEqual(self.action(user=True), gate.SKIPPED_USER)
+        self.assertEqual(self.action(answered=True), gate.SKIPPED_RECOVERED)
+
+    def test_gives_up_after_the_last_resume(self):
+        self.assertEqual(self.action({**self.ENTRY, "resumes": gate.MAX_RESUMES}), gate.GAVE_UP)
+
+    def test_settings(self):
+        s = gate.settings_from({"resume_within_hours": 0, "resume_message": "  Go on.  "})
+        self.assertTrue(s.resume_interrupted_chats)
+        self.assertEqual((s.resume_within_hours, s.resume_message), (0.5, "Go on."))
+        self.assertFalse(gate.settings_from({"resume_interrupted_chats": False}).resume_interrupted_chats)
+
+
+class InterruptedChatTest(RuntimeTest):
+    SID = "20261012_224043_e574c8"
+    LIMIT = {"status_code": 429, "reason": "rate_limit",
+             "error": {"type": "ClaudeAPIError", "message": "HTTP 429: You've hit your session limit"}}
+
+    def setUp(self):
+        super().setUp()
+        import sqlite3
+        self.root = Path(os.environ["USAGE_GATE_HERMES_ROOT"])
+        self.db = sqlite3.connect(self.root / "profiles" / "cto" / "state.db")
+        self.db.executescript("create table sessions (id text primary key, title text);"
+                              "create table messages (id integer primary key, session_id text, role text, content text,"
+                              " tool_calls text, display_kind text, timestamp real);")
+        self.db.execute("insert into sessions values (?, ?)", (self.SID, "First 1:1"))
+        self.db.commit()
+        self.kanban_env = mock.patch.dict(os.environ, {}, clear=False)
+        self.kanban_env.start()
+        os.environ.pop("HERMES_KANBAN_TASK", None)
+
+    def tearDown(self):
+        self.kanban_env.stop()
+        self.db.close()
+        super().tearDown()
+
+    def message(self, role, at, content="text", tool_calls=None, display_kind=None):
+        self.db.execute("insert into messages (session_id, role, content, tool_calls, display_kind, timestamp)"
+                        " values (?, ?, ?, ?, ?, ?)", (self.SID, role, content, tool_calls, display_kind, at.timestamp()))
+        self.db.commit()
+
+    def stop(self, at=NOW, platform="desktop", **overrides):
+        with mock.patch.object(runtime, "utcnow", return_value=at), \
+             mock.patch.object(runtime, "_current_profile", return_value="default"):
+            runtime.on_api_request_error(session_id=self.SID, platform=platform, provider="claude",
+                                         **{**self.LIMIT, **overrides})
+
+    def refresh(self, at, claude=OPEN):
+        used = 5 if claude == OPEN else 100
+        reading = lambda provider, models: Reading(provider, at, windows=(
+            {"label": "Current session", "kind": "session", "used_percent": used if provider == "claude" else 5},))
+        with mock.patch.object(runtime, "fetch", side_effect=reading), NO_CARDS, \
+             mock.patch.object(runtime, "utcnow", return_value=at), \
+             mock.patch.object(runtime, "_hermes", return_value=SimpleNamespace(returncode=0, stderr="")), \
+             mock.patch.object(runtime, "start_resume") as start:
+            runtime.refresh(force=True)
+        return start
+
+    def entry(self):
+        return runtime.load_interruptions()[f"cto:{self.SID}"]
+
+    def test_desktop_chat_is_kept_under_the_profile_that_holds_it(self):
+        self.stop()
+        entry = self.entry()
+        self.assertEqual((entry["profile"], entry["status"], entry["resumes"]), ("cto", "waiting", 0))
+        self.assertEqual(entry["first_interrupted_at"], NOW.isoformat())
+
+    def test_board_workers_schedules_and_other_failures_are_ignored(self):
+        with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_1"}):
+            self.stop()
+        self.stop(platform="cron")
+        self.stop(status_code=500, reason="server_error", error={"type": "APIError", "message": "Internal error"})
+        self.assertEqual(runtime.load_interruptions(), {})
+
+    def test_waits_while_paused_then_resumes_once(self):
+        self.stop()
+        self.assertFalse(self.refresh(NOW + timedelta(minutes=10), claude=PAUSED).called)
+        self.assertEqual(self.entry()["status"], "waiting")
+        start = self.refresh(NOW + timedelta(hours=2))
+        start.assert_called_once_with("cto", self.SID, gate.DEFAULTS["resume_message"])
+        self.assertEqual((self.entry()["status"], self.entry()["resumes"]), ("resumed", 1))
+        self.assertFalse(self.refresh(NOW + timedelta(hours=2, minutes=10)).called)
+
+    def test_the_failed_turn_note_is_not_an_answer(self):
+        self.stop()
+        self.message("assistant", NOW + timedelta(seconds=1), "Your request was not processed.", display_kind="failed_turn")
+        self.message("assistant", NOW + timedelta(seconds=2), "", tool_calls='[{"id": "x"}]')
+        self.assertTrue(self.refresh(NOW + timedelta(hours=2)).called)
+
+    def test_an_answer_or_your_message_drops_it(self):
+        self.stop()
+        self.message("assistant", NOW + timedelta(minutes=1), "Done.")
+        self.assertFalse(self.refresh(NOW + timedelta(hours=2)).called)
+        self.assertEqual(self.entry()["status"], gate.SKIPPED_RECOVERED)
+        self.stop(at=NOW + timedelta(hours=3))
+        self.message("user", NOW + timedelta(hours=3, minutes=1), "Never mind")
+        self.assertFalse(self.refresh(NOW + timedelta(hours=4)).called)
+        self.assertEqual(self.entry()["status"], gate.SKIPPED_USER)
+
+    def test_a_resume_that_hits_the_limit_again_continues_the_same_stop(self):
+        self.stop()
+        self.refresh(NOW + timedelta(hours=2))
+        self.stop(at=NOW + timedelta(hours=2, minutes=1), platform="cli")
+        entry = self.entry()
+        self.assertEqual((entry["status"], entry["resumes"], entry["platform"]), ("waiting", 1, "desktop"))
+        self.assertEqual(entry["first_interrupted_at"], NOW.isoformat())
+
+    def test_a_later_stop_after_a_resume_starts_over(self):
+        self.stop()
+        self.refresh(NOW + timedelta(hours=2))
+        self.stop(at=NOW + timedelta(days=2))
+        self.assertEqual((self.entry()["resumes"], self.entry()["first_interrupted_at"]),
+                         (0, (NOW + timedelta(days=2)).isoformat()))
+
+    def test_status_view_lists_it_with_its_title(self):
+        self.stop()
+        with NO_CARDS:
+            view = runtime.status_view()
+        self.assertEqual([(c["profile"], c["title"], c["status"]) for c in view["interrupted"]],
+                         [("cto", "First 1:1", "waiting")])
+
+
 if __name__ == "__main__":
     unittest.main()

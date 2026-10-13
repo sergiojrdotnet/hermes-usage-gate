@@ -12,9 +12,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
-from usage_gate.gate import PAUSED, Reading, allowlist, decide, held_comment, reading_from_snapshot, settings_from, utcnow
+from usage_gate.gate import (PAUSED, RESUME, WAIT, Reading, allowlist, decide, held_comment, is_limit_error,
+                             reading_from_snapshot, resume_action, settings_from, utcnow)
 
 log = logging.getLogger("hermes_usage_gate")
+CHAT_PLATFORMS = ("desktop", "tui", "cli")
+RESUME_CHAIN = timedelta(hours=1)
 _lock = threading.Lock()
 _running = threading.Event()
 
@@ -166,16 +169,193 @@ def apply_allowlist(allowed: Optional[list[str]], applied: Optional[list[str]]) 
 
 
 @contextlib.contextmanager
-def _exclusive():
-    """One refresh at a time across threads, processes and every profile's copy of this plugin."""
-    path = hermes_root() / "usage-gate" / "refresh.lock"
+def _file_lock(name: str):
+    path = hermes_root() / "usage-gate" / name
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with _lock, open(path, "a") as handle:
+    with open(path, "a") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _exclusive():
+    """One refresh at a time across threads, processes and every profile's copy of this plugin."""
+    with _lock, _file_lock("refresh.lock"):
+        yield
+
+
+def interruptions_path() -> Path:
+    return hermes_root() / "usage-gate" / "interrupted.json"
+
+
+def load_interruptions() -> dict:
+    try:
+        return json.loads(interruptions_path().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_interruptions(entries: dict) -> None:
+    path = interruptions_path()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(entries, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+def _current_profile() -> str:
+    try:
+        from hermes_constants import get_hermes_home
+        home = Path(get_hermes_home())
+    except Exception:
+        home = Path(os.environ.get("HERMES_HOME") or hermes_root())
+    return home.name if home.parent.name == "profiles" else "default"
+
+
+def record_interruption(profile: str, session_id: str, provider: str, platform: str, error: str,
+                        at: Optional[datetime] = None) -> None:
+    """Note a chat whose model call failed on its plan's limit, so it is resumed once the limit is back. A failure
+    in a chat still waiting, or shortly after the gate resumed it, continues the same interruption: its expiry
+    still counts from the first failure and its resumes keep adding up."""
+    at = at or utcnow()
+    with _file_lock("interrupted.lock"):
+        entries = load_interruptions()
+        key = f"{profile}:{session_id}"
+        previous = entries.get(key) or {}
+        resolved = previous.get("resolved_at")
+        chained = previous.get("status") == "waiting" or (
+            previous.get("status") == "resumed" and resolved and at - datetime.fromisoformat(resolved) < RESUME_CHAIN)
+        entries[key] = {"profile": profile, "session_id": session_id, "provider": provider,
+                        "platform": previous.get("platform", platform) if chained else platform,
+                        "first_interrupted_at": previous.get("first_interrupted_at", at.isoformat()) if chained
+                        else at.isoformat(),
+                        "interrupted_at": at.isoformat(), "resumes": previous.get("resumes", 0) if chained else 0,
+                        "error": error[:300], "status": "waiting"}
+        _save_interruptions(entries)
+
+
+def on_api_request_error(session_id: str = "", platform: str = "", provider: str = "", status_code: Any = None,
+                         reason: Any = None, error: Any = None, **_: Any) -> None:
+    """Hook for every failed model call: keep the chats that stopped on a plan limit. Board cards, schedules,
+    webhooks and email runs are left out; the dispatcher and their schedules already take care of them."""
+    try:
+        if not session_id or platform not in CHAT_PLATFORMS or os.environ.get("HERMES_KANBAN_TASK"):
+            return
+        if not is_limit_error(status_code, reason, error):
+            return
+        message = error.get("message", "") if isinstance(error, dict) else str(error or "")
+        record_interruption(_profile_of(session_id), session_id, provider, platform, message)
+    except Exception:
+        log.exception("usage gate: could not record an interrupted chat")
+
+
+def _state_db(profile: str) -> Path:
+    root = hermes_root()
+    return (root if profile == "default" else root / "profiles" / profile) / "state.db"
+
+
+@contextlib.contextmanager
+def _session_store(profile: str):
+    import sqlite3
+    connection = sqlite3.connect(f"file:{_state_db(profile)}?mode=ro", uri=True, timeout=10)
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def _has_session(profile: str, session_id: str) -> bool:
+    if not _state_db(profile).exists():
+        return False
+    with _session_store(profile) as store:
+        return store.execute("select 1 from sessions where id=?", (session_id,)).fetchone() is not None
+
+
+def _profile_of(session_id: str) -> str:
+    """The profile whose session store holds the chat. The Desktop's backend serves every profile from one
+    process, so the process's own Hermes home is only the first guess."""
+    guess = _current_profile()
+    for profile in [guess, *(p for p in profile_models() if p != guess)]:
+        try:
+            if _has_session(profile, session_id):
+                return profile
+        except Exception:
+            continue
+    return guess
+
+
+def session_title(profile: str, session_id: str) -> str:
+    if not _state_db(profile).exists():
+        return ""
+    with _session_store(profile) as store:
+        row = store.execute("select title from sessions where id=?", (session_id,)).fetchone()
+    return row[0] if row and row[0] else ""
+
+
+def session_since(profile: str, session_id: str, since: datetime) -> tuple[bool, bool]:
+    """(you wrote after ``since``, the bot answered after ``since``) from the profile's session store. The note
+    Hermes leaves for a failed turn is not an answer."""
+    if not _state_db(profile).exists():
+        return False, False
+    epoch = since.timestamp()
+    with _session_store(profile) as store:
+        user = store.execute("select 1 from messages where session_id=? and role='user' and timestamp>? limit 1",
+                             (session_id, epoch)).fetchone()
+        answer = store.execute(
+            "select 1 from messages where session_id=? and role='assistant' and timestamp>? and coalesce(content,'')!=''"
+            " and coalesce(tool_calls,'') in ('', '[]', 'null') and coalesce(display_kind,'')!='failed_turn' limit 1",
+            (session_id, epoch)).fetchone()
+    return bool(user), bool(answer)
+
+
+def start_resume(profile: str, session_id: str, message: str) -> None:
+    """Send ``message`` into the chat as a one-shot turn, in the background; its output goes to a log file."""
+    logs = hermes_root() / "usage-gate" / "resume-logs"
+    logs.mkdir(mode=0o700, parents=True, exist_ok=True)
+    binary = os.environ.get("USAGE_GATE_HERMES_BIN") or str(Path.home() / ".local" / "bin" / "hermes")
+    with open(logs / f"{profile}-{session_id}.log", "a") as out:
+        subprocess.Popen([binary, "-p", profile, "chat", "--resume", session_id, "-q", message, "--oneshot"],
+                         stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def resume_interrupted_chats(settings: Any, providers: dict[str, dict]) -> None:
+    """Resume each waiting chat whose plan is open again, once; drop the expired ones and the ones you or the
+    bot already continued."""
+    now = utcnow()
+    within = timedelta(hours=settings.resume_within_hours)
+    with _file_lock("interrupted.lock"):
+        entries = load_interruptions()
+        for key, entry in entries.items():
+            if entry.get("status") != "waiting":
+                continue
+            try:
+                user_after, answered_after = session_since(entry["profile"], entry["session_id"],
+                                                           datetime.fromisoformat(entry["interrupted_at"]))
+            except Exception as exc:
+                log.warning("usage gate: could not read %s: %s", key, exc)
+                continue
+            action = resume_action(entry, providers.get(entry.get("provider", "")), now, within, user_after,
+                                   answered_after)
+            if action == WAIT:
+                continue
+            if action == RESUME:
+                try:
+                    start_resume(entry["profile"], entry["session_id"], settings.resume_message)
+                except OSError as exc:
+                    log.warning("usage gate: could not resume %s: %s", key, exc)
+                    continue
+                entry["status"] = "resumed"
+                entry["resumes"] = entry.get("resumes", 0) + 1
+                log.warning("usage gate: resumed %s's chat %s", entry["profile"], entry["session_id"])
+            else:
+                entry["status"] = action
+            entry["resolved_at"] = now.isoformat()
+        cutoff = now - timedelta(days=7)
+        entries = {k: e for k, e in entries.items()
+                   if e.get("status") == "waiting" or datetime.fromisoformat(e.get("resolved_at", e["interrupted_at"])) > cutoff}
+        _save_interruptions(entries)
 
 
 def refresh(force: bool = False) -> dict:
@@ -206,6 +386,8 @@ def refresh(force: bool = False) -> dict:
         notes = state.get("held_notes") or {}
         if settings.enabled and settings.comment_held_cards:
             notes = comment_held_cards(settings, profiles, providers, notes)
+        if settings.enabled and settings.resume_interrupted_chats:
+            resume_interrupted_chats(settings, providers)
         state = {"checked_at": now.isoformat(), "enabled": settings.enabled, "settings": settings_view(settings),
                  "providers": providers, "applied": applied, "held_notes": notes}
         save_state(state)
@@ -216,6 +398,8 @@ def settings_view(settings: Any) -> dict:
     return {"enabled": settings.enabled, "session_percent": settings.default.session_percent,
             "week_percent": settings.default.week_percent, "refresh_minutes": settings.refresh_minutes,
             "hold_minutes": settings.hold_minutes, "comment_held_cards": settings.comment_held_cards,
+            "resume_interrupted_chats": settings.resume_interrupted_chats, "resume_message": settings.resume_message,
+            "resume_within_hours": settings.resume_within_hours,
             "providers": {p: {**settings.per_provider.get(p, {}),
                               **({"label": settings.labels[p]} if p in settings.labels else {})}
                           for p in sorted(set(settings.per_provider) | set(settings.labels))}}
@@ -239,7 +423,20 @@ def status_view() -> dict:
     held = [{k: c.get(k) for k in ("id", "title", "assignee", "status")} for c in held_cards(paused)] if paused else []
     tz = _timezone()
     return {"settings": settings_view(settings), "checked_at": state.get("checked_at"), "plans": plans,
-            "allowlist": state.get("applied"), "held": held, "timezone": getattr(tz, "key", None)}
+            "allowlist": state.get("applied"), "held": held, "interrupted": interrupted_view(settings),
+            "timezone": getattr(tz, "key", None)}
+
+
+def interrupted_view(settings: Any) -> list[dict]:
+    """The chats stopped by a plan limit in the last week, newest first, each with its title and plan label."""
+    rows = []
+    for entry in load_interruptions().values():
+        try:
+            title = session_title(entry["profile"], entry["session_id"])
+        except Exception:
+            title = ""
+        rows.append({**entry, "title": title, "label": settings.label(entry.get("provider", ""))})
+    return sorted(rows, key=lambda e: e.get("interrupted_at", ""), reverse=True)
 
 
 def on_dispatch_tick(profile_name: Optional[str] = None, **_: Any) -> None:

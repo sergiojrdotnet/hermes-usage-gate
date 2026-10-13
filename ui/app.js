@@ -99,6 +99,33 @@ function createUsageGate(React, api) {
         h('td', { style: s.td }, c.status === 'review' ? 'Review' : 'Ready')))))
   }
 
+  const INTERRUPTION_STATUS = {
+    waiting: { label: 'Waiting for the plan', color: C.orange },
+    resumed: { label: 'Resumed', color: C.green },
+    expired: { label: 'Expired', color: C.muted },
+    'gave-up': { label: 'Gave up', color: C.red },
+    'skipped-user': { label: 'You continued it', color: C.muted },
+    'skipped-recovered': { label: 'Already answered', color: C.muted }
+  }
+
+  function Interrupted({ chats }) {
+    if (!chats.length) return h('div', { style: s.empty }, 'No chat was stopped by a plan limit this week.')
+    return h('table', { style: s.table },
+      h('thead', null, h('tr', null, ['Bot', 'Chat', 'Plan', 'Stopped', 'Status'].map(t => h('th', { key: t, style: s.th }, t)))),
+      h('tbody', null, chats.map(c => {
+        const status = INTERRUPTION_STATUS[c.status] || { label: c.status, color: C.muted }
+        return h('tr', { key: `${c.profile}:${c.session_id}` },
+          h('td', { style: s.td }, c.profile),
+          h('td', { style: s.td }, c.title || h('span', { style: s.mono }, c.session_id)),
+          h('td', { style: s.td }, c.label),
+          h('td', { style: s.td }, when(c.interrupted_at)),
+          h('td', { style: s.td },
+            h('span', { style: s.badge(status.color) }, status.label),
+            c.resumes > 0 && h('span', { style: { ...s.note, marginLeft: 6 } }, `${c.resumes} resume${c.resumes > 1 ? 's' : ''}`),
+            c.resolved_at && h('div', { style: s.note }, when(c.resolved_at))))
+      })))
+  }
+
   function SettingsSummary({ settings, plans }) {
     const pct = v => `${Math.round(Number(v))}%`
     const rows = [
@@ -107,8 +134,13 @@ function createUsageGate(React, api) {
       ['Weekly threshold', pct(settings.week_percent)],
       ['Check every', `${settings.refresh_minutes} min`],
       ["Keep a pause when usage can't be read", `${settings.hold_minutes} min`],
-      ['Comment on held cards', settings.comment_held_cards ? 'Yes' : 'No']
+      ['Comment on held cards', settings.comment_held_cards ? 'Yes' : 'No'],
+      ['Resume chats stopped by a plan limit', settings.resume_interrupted_chats ? 'Yes' : 'No']
     ]
+    if (settings.resume_interrupted_chats) {
+      rows.push(['Resume within', `${settings.resume_within_hours} h of the first stop`])
+      rows.push(['Resume message', settings.resume_message])
+    }
     plans.forEach(plan => {
       const own = (settings.providers || {})[plan.provider] || {}
       if (own.session_percent !== undefined || own.week_percent !== undefined) {
@@ -147,12 +179,14 @@ function createUsageGate(React, api) {
           !status.settings.enabled ? 'Disabled' : paused.length ? `${paused.length} plan${paused.length > 1 ? 's' : ''} paused` : 'All plans open'),
         h('span', { style: s.note }, `Checked ${ago(status.checked_at)} · every ${status.settings.refresh_minutes} min`),
         h('button', { type: 'button', onClick: check, disabled: checking, style: s.button() }, checking ? 'Checking…' : 'Check now')),
-      h('div', { style: s.note }, 'New board cards for a plan’s bots wait while its usage is over a threshold. Chats, schedules, webhooks and email runs are never held.'),
+      h('div', { style: s.note }, 'New board cards for a plan’s bots wait while its usage is over a threshold. Chats, schedules, webhooks and email runs are never held; a chat a plan limit stopped is resumed once the plan is open again.'),
       error && h('div', { style: s.error }, error),
       h('div', { style: s.section }, 'Plans'),
       h('div', { style: s.cards }, status.plans.map(plan => h(Plan, { key: plan.provider, plan, refreshMinutes: status.settings.refresh_minutes }))),
       h('div', { style: s.section }, 'Held cards'),
       h(Held, { cards: status.held || [] }),
+      h('div', { style: s.section }, 'Interrupted chats'),
+      h(Interrupted, { chats: status.interrupted || [] }),
       h('div', { style: s.section }, 'Settings'),
       h(SettingsSummary, { settings: status.settings, plans: status.plans }))
   }
